@@ -1,0 +1,12 @@
+{
+  "name": "gabinarou-webview-apk-builder",
+  "version": "2.0.0",
+  "description": "Android WebView APK Builder",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
