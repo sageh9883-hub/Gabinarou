@@ -256,6 +256,4 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("========================================");
 });
 
-Important : ce fichier suppose que ton "Dockerfile" installe Node/Express et que "/builder/build.sh" existe réellement dans l'image. Donc ne déploie pas encore si ton "Dockerfile" actuel ne correspond pas à ça.
 
-Si tu me donnes maintenant ton "Dockerfile" actuel, je te donne la version compatible "Dockerfile + server.js + build.sh" pour que les logs apparaissent réellement.
