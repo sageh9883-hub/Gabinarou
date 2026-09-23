@@ -2,13 +2,38 @@ FROM node:20-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# ============================================================
+# ENVIRONNEMENT ANDROID
+# ============================================================
+
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
 ENV ANDROID_HOME=/opt/android-sdk
 
-ENV PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:$PATH
+ENV PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/gradle/gradle-9.7.1/bin:$PATH
 
 # ============================================================
-# DEPENDENCIES
+# LIMITES MÉMOIRE
+# ============================================================
+
+ENV JAVA_TOOL_OPTIONS="-Xmx256m -XX:MaxMetaspaceSize=128m"
+ENV GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx256m -Dorg.gradle.daemon=false"
+
+# ============================================================
+# GRADLE
+# ============================================================
+
+ENV GRADLE_VERSION=9.7.1
+ENV GRADLE_HOME=/opt/gradle/gradle-9.7.1
+
+# ============================================================
+# PORT
+# ============================================================
+
+ENV NODE_ENV=production
+ENV PORT=10000
+
+# ============================================================
+# INSTALLATION DES OUTILS SYSTÈME
 # ============================================================
 
 RUN apt-get update && apt-get install -y \
@@ -39,24 +64,26 @@ RUN wget -q \
     && rm -f /tmp/cmdline-tools.zip
 
 # ============================================================
-# ANDROID LICENSES
+# LICENCES ANDROID
 # ============================================================
 
 RUN yes | sdkmanager --licenses >/dev/null || true
 
 # ============================================================
-# ANDROID SDK 37
+# INSTALLATION DU SDK ANDROID 37
 # ============================================================
 
 RUN set -eux; \
     sdkmanager --list --channel=3 > /tmp/sdk-list; \
-    echo "===== ANDROID 37 PACKAGES ====="; \
+    echo "========================================"; \
+    echo "ANDROID 37 PACKAGES DISPONIBLES"; \
+    echo "========================================"; \
     grep -E 'platforms;android-37|build-tools;37' /tmp/sdk-list || true; \
-    echo "==============================="; \
+    echo "========================================"; \
     PLATFORM="$(grep -oE 'platforms;android-37([.]?[0-9]+)?' /tmp/sdk-list | sort -V | tail -1)"; \
     BUILD_TOOLS="$(grep -oE 'build-tools;37[.][0-9]+[.][0-9]+' /tmp/sdk-list | sort -V | tail -1)"; \
-    echo "Platform: ${PLATFORM}"; \
-    echo "Build Tools: ${BUILD_TOOLS}"; \
+    echo "Platform sélectionnée: ${PLATFORM}"; \
+    echo "Build Tools sélectionné: ${BUILD_TOOLS}"; \
     test -n "${PLATFORM}"; \
     test -n "${BUILD_TOOLS}"; \
     yes | sdkmanager --channel=3 \
@@ -65,44 +92,82 @@ RUN set -eux; \
         "${BUILD_TOOLS}"
 
 # ============================================================
-# BUILDER
+# INSTALLATION DE GRADLE 9.7.1
+# ============================================================
+
+RUN mkdir -p /opt/gradle \
+    && wget -q \
+    https://services.gradle.org/distributions/gradle-9.7.1-bin.zip \
+    -O /tmp/gradle.zip \
+    && unzip -q /tmp/gradle.zip -d /opt/gradle \
+    && rm -f /tmp/gradle.zip \
+    && /opt/gradle/gradle-9.7.1/bin/gradle --version
+
+# ============================================================
+# DOSSIER DU BUILDER
 # ============================================================
 
 WORKDIR /builder
+
+# ============================================================
+# CLONAGE DU TEMPLATE ANDROID
+# ============================================================
 
 RUN git clone --depth 1 \
     https://github.com/xchacha20-poly1305/webview-apk-template.git \
     /builder/template
 
 # ============================================================
-# NODE API
+# NODE.JS
 # ============================================================
 
 COPY package.json ./
 
 RUN npm install --omit=dev
 
+# ============================================================
+# SERVEUR
+# ============================================================
+
 COPY server.js ./
 
 # ============================================================
-# DIRECTORIES
+# DOSSIERS DE TRAVAIL
 # ============================================================
 
 RUN mkdir -p \
     /builder/jobs \
     /builder/builds \
+    /builder/workspaces \
     /builder/.gradle
 
-ENV NODE_ENV=production
-ENV PORT=10000
+# ============================================================
+# GRADLE CACHE
+# ============================================================
+
 ENV GRADLE_USER_HOME=/builder/.gradle
-ENV JAVA_TOOL_OPTIONS="-Xmx256m -XX:MaxMetaspaceSize=128m"
-ENV GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx256m -Dorg.gradle.daemon=false"
+
+# ============================================================
+# INFORMATIONS DE BUILD
+# ============================================================
+
+RUN echo "========================================" \
+    && echo "GABINAROU WEBVIEW APK BUILDER V3.3" \
+    && echo "========================================" \
+    && java -version \
+    && gradle --version \
+    && echo "Android SDK: ${ANDROID_SDK_ROOT}" \
+    && echo "Gradle Home: ${GRADLE_HOME}" \
+    && echo "========================================"
+
+# ============================================================
+# PORT
+# ============================================================
 
 EXPOSE 10000
 
 # ============================================================
-# START SERVER
+# START
 # ============================================================
 
 CMD ["node", "server.js"]
