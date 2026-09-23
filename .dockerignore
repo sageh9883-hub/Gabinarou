@@ -1,10 +1,13 @@
 .git
 .gitignore
 node_modules
+.env
 *.apk
 *.aab
 *.jks
 *.keystore
 *.p12
-.env
+jobs
+builds
+.gradle
 README*
