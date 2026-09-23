@@ -1,76 +1,106 @@
-FROM ubuntu:24.04
+FROM node:20-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
+
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
 ENV ANDROID_HOME=/opt/android-sdk
-ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/build-tools/37.0.0
 
-# ==========================================
-# SYSTEM DEPENDENCIES
-# ==========================================
+ENV PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:$PATH
+
+# ============================================================
+# DEPENDENCIES
+# ============================================================
 
 RUN apt-get update && apt-get install -y \
     openjdk-17-jdk \
-    nodejs \
-    npm \
     wget \
     unzip \
+    zip \
     git \
     curl \
-    zip \
     ca-certificates \
     bash \
     && rm -rf /var/lib/apt/lists/*
 
-# ==========================================
-# ANDROID SDK
-# ==========================================
+# ============================================================
+# ANDROID COMMAND LINE TOOLS
+# ============================================================
 
 RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools
 
-RUN wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip \
+RUN wget -q \
+    https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip \
     -O /tmp/cmdline-tools.zip \
-    && unzip -q /tmp/cmdline-tools.zip -d ${ANDROID_SDK_ROOT}/cmdline-tools \
-    && mv ${ANDROID_SDK_ROOT}/cmdline-tools/cmdline-tools ${ANDROID_SDK_ROOT}/cmdline-tools/latest \
-    && rm /tmp/cmdline-tools.zip
+    && unzip -q /tmp/cmdline-tools.zip \
+       -d ${ANDROID_SDK_ROOT}/cmdline-tools \
+    && mv \
+       ${ANDROID_SDK_ROOT}/cmdline-tools/cmdline-tools \
+       ${ANDROID_SDK_ROOT}/cmdline-tools/latest \
+    && rm -f /tmp/cmdline-tools.zip
+
+# ============================================================
+# ANDROID LICENSES
+# ============================================================
 
 RUN yes | sdkmanager --licenses >/dev/null || true
 
-RUN sdkmanager \
-    "platform-tools" \
-    "platforms;android-37" \
-    "build-tools;37.0.0"
+# ============================================================
+# ANDROID SDK 37
+# ============================================================
 
-# ==========================================
+RUN set -eux; \
+    sdkmanager --list --channel=3 > /tmp/sdk-list; \
+    echo "===== ANDROID 37 PACKAGES ====="; \
+    grep -E 'platforms;android-37|build-tools;37' /tmp/sdk-list || true; \
+    echo "==============================="; \
+    PLATFORM="$(grep -oE 'platforms;android-37([.]?[0-9]+)?' /tmp/sdk-list | sort -V | tail -1)"; \
+    BUILD_TOOLS="$(grep -oE 'build-tools;37[.][0-9]+[.][0-9]+' /tmp/sdk-list | sort -V | tail -1)"; \
+    echo "Platform: ${PLATFORM}"; \
+    echo "Build Tools: ${BUILD_TOOLS}"; \
+    test -n "${PLATFORM}"; \
+    test -n "${BUILD_TOOLS}"; \
+    yes | sdkmanager --channel=3 \
+        "platform-tools" \
+        "${PLATFORM}" \
+        "${BUILD_TOOLS}"
+
+# ============================================================
 # BUILDER
-# ==========================================
+# ============================================================
 
 WORKDIR /builder
 
 RUN git clone --depth 1 \
     https://github.com/xchacha20-poly1305/webview-apk-template.git \
-    template
+    /builder/template
 
-COPY build.sh /builder/build.sh
-RUN chmod +x /builder/build.sh
+# ============================================================
+# NODE API
+# ============================================================
 
-# ==========================================
-# NODE SERVER
-# ==========================================
-
-COPY package.json /builder/package.json
-COPY server.js /builder/server.js
+COPY package.json ./
 
 RUN npm install --omit=dev
 
-# ==========================================
-# START SERVER
-# ==========================================
+COPY server.js ./
+
+# ============================================================
+# DIRECTORIES
+# ============================================================
+
+RUN mkdir -p \
+    /builder/jobs \
+    /builder/builds \
+    /builder/.gradle
+
+ENV NODE_ENV=production
+ENV PORT=10000
+ENV GRADLE_USER_HOME=/builder/.gradle
 
 EXPOSE 10000
 
-CMD ["node", "/builder/server.js"]
+# ============================================================
+# START SERVER
+# ============================================================
 
-Et il faut aussi "package.json"
-
-À la racine de ton dépôt, crée/remplace :
+CMD ["node", "server.js"]
