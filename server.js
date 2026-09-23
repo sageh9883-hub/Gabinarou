@@ -1,1285 +1,406 @@
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
+
 const fs = require("fs");
+const fsp = require("fs/promises");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 const app = express();
 
-// ============================================================
-// CONFIG
-// ============================================================
-
-const PORT = Number(process.env.PORT || 10000);
+const PORT = process.env.PORT || 10000;
 const HOST = "0.0.0.0";
 
-const ROOT = "/builder";
+const VERSION = "3.3.0";
 
-const TEMPLATE = path.join(
-  ROOT,
-  "template"
-);
+const BUILDER_DIR = "/builder";
+const TEMPLATE_DIR = path.join(BUILDER_DIR, "template");
+const JOBS_DIR = path.join(BUILDER_DIR, "jobs");
+const BUILDS_DIR = path.join(BUILDER_DIR, "builds");
+const WORKSPACES_DIR = path.join(BUILDER_DIR, "workspaces");
+const GRADLE_CACHE_DIR = path.join(BUILDER_DIR, ".gradle");
 
-const JOBS_DIR = path.join(
-  ROOT,
-  "jobs"
-);
+const GRADLE_BIN = "/opt/gradle/gradle-9.7.1/bin/gradle";
 
-const BUILDS_DIR = path.join(
-  ROOT,
-  "builds"
-);
+const JAVA_TOOL_OPTIONS =
+  "-Xmx256m -XX:MaxMetaspaceSize=128m";
 
-const WORKSPACES_DIR = path.join(
-  ROOT,
-  "workspaces"
-);
+const GRADLE_OPTS =
+  "-Dorg.gradle.jvmargs=-Xmx256m -Dorg.gradle.daemon=false";
 
-const API_KEY =
-  process.env.BUILDER_API_KEY || "";
+const BUILD_TIMEOUT =
+  Number(process.env.BUILD_TIMEOUT_MS || 600000);
 
-// Gradle timeout: 10 minutes
-const GRADLE_TIMEOUT =
-  Number(
-    process.env.GRADLE_TIMEOUT_MS ||
-    10 * 60 * 1000
-  );
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 3);
 
-// ============================================================
-// DIRECTORIES
-// ============================================================
+let queue = Promise.resolve();
+let queuedBuilds = 0;
 
-fs.mkdirSync(
-  JOBS_DIR,
-  {
-    recursive: true
-  }
-);
-
-fs.mkdirSync(
-  BUILDS_DIR,
-  {
-    recursive: true
-  }
-);
-
-fs.mkdirSync(
-  WORKSPACES_DIR,
-  {
-    recursive: true
-  }
-);
-
-// ============================================================
-// EXPRESS
-// ============================================================
-
+app.use(cors());
 app.use(
-  helmet()
-);
-
-app.use(
-  cors()
-);
-
-app.use(
-  express.json({
-    limit: "2mb"
+  helmet({
+    crossOriginResourcePolicy: false
   })
 );
+app.use(express.json({ limit: "2mb" }));
 
 // ============================================================
-// PROCESS DIAGNOSTICS
+// UTILITIES
 // ============================================================
 
-process.on(
-  "exit",
-  (code) => {
-    console.log(
-      `[PROCESS] Node exiting with code ${code}`
-    );
-  }
-);
-
-process.on(
-  "SIGTERM",
-  () => {
-    console.error(
-      "[PROCESS] SIGTERM received"
-    );
-  }
-);
-
-process.on(
-  "SIGINT",
-  () => {
-    console.error(
-      "[PROCESS] SIGINT received"
-    );
-  }
-);
-
-process.on(
-  "uncaughtException",
-  (error) => {
-    console.error(
-      "[PROCESS] UNCAUGHT EXCEPTION"
-    );
-
-    console.error(
-      error.stack || error
-    );
-  }
-);
-
-process.on(
-  "unhandledRejection",
-  (reason) => {
-    console.error(
-      "[PROCESS] UNHANDLED REJECTION"
-    );
-
-    console.error(
-      reason
-    );
-  }
-);
-
-// ============================================================
-// BUILD QUEUE
-// ============================================================
-//
-// Important on Render Free:
-// We only allow one Android/Gradle build at a time.
-// This avoids two Gradle JVMs consuming the 512 MB RAM
-// simultaneously.
-//
-
-let buildQueue = Promise.resolve();
-
-function queueBuild(job) {
-
-  const current =
-    buildQueue.then(
-      async () => {
-        return processBuild(job);
-      }
-    );
-
-  buildQueue =
-    current.catch(
-      (error) => {
-        console.error(
-          `[QUEUE ${job.id}] ${error.stack || error}`
-        );
-      }
-    );
-
-  return current;
+function now() {
+  return new Date().toISOString();
 }
 
-// ============================================================
-// LOGGING
-// ============================================================
+function memoryInfo() {
+  const m = process.memoryUsage();
 
-function log(
-  id,
-  message
-) {
+  return {
+    rss: `${Math.round(m.rss / 1024 / 1024)}MB`,
+    heapUsed: `${Math.round(m.heapUsed / 1024 / 1024)}MB`,
+    heapTotal: `${Math.round(m.heapTotal / 1024 / 1024)}MB`,
+    external: `${Math.round(m.external / 1024 / 1024)}MB`
+  };
+}
+
+function logMemory(id) {
+  const m = memoryInfo();
+
   console.log(
-    `[BUILD ${id}] ${message}`
+    `[BUILD ${id}] Node memory: ` +
+    `RSS=${m.rss} ` +
+    `HeapUsed=${m.heapUsed} ` +
+    `HeapTotal=${m.heapTotal} ` +
+    `External=${m.external}`
   );
 }
 
-// ============================================================
-// HELPERS
-// ============================================================
-
-function makeId() {
-  return crypto
-    .randomBytes(12)
-    .toString("hex");
+function log(id, message) {
+  console.log(`[BUILD ${id}] ${message}`);
 }
 
-function saveJob(job) {
-
-  fs.writeFileSync(
-    path.join(
-      JOBS_DIR,
-      `${job.id}.json`
-    ),
-    JSON.stringify(
-      job,
-      null,
-      2
-    )
-  );
+function errorLog(id, message) {
+  console.error(`[BUILD ${id}] ${message}`);
 }
 
-function loadJob(id) {
+function safeName(value, fallback) {
+  const result = String(value || fallback)
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 80);
 
-  const file =
-    path.join(
-      JOBS_DIR,
-      `${id}.json`
-    );
-
-  if (
-    !fs.existsSync(file)
-  ) {
-    return null;
-  }
-
-  return JSON.parse(
-    fs.readFileSync(
-      file,
-      "utf8"
-    )
-  );
+  return result || fallback;
 }
 
-function updateJob(
-  job,
-  values = {}
-) {
-
-  Object.assign(
-    job,
-    values
-  );
-
-  job.updatedAt =
-    new Date().toISOString();
-
-  saveJob(job);
+function validPackageName(pkg) {
+  return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(pkg);
 }
 
-function validateUrl(
-  value
-) {
-
+function isHttpsUrl(value) {
   try {
-
-    const u =
-      new URL(value);
-
-    if (
-      u.protocol !==
-      "https:"
-    ) {
-      return false;
-    }
-
-    if (
-      u.username ||
-      u.password
-    ) {
-      return false;
-    }
-
-    return true;
-
+    const u = new URL(value);
+    return u.protocol === "https:";
   } catch {
-
     return false;
   }
 }
 
-function validatePackage(
-  value
-) {
+function jobPath(id) {
+  return path.join(JOBS_DIR, `${id}.json`);
+}
 
-  return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(
-    value
+async function saveJob(job) {
+  await fsp.writeFile(
+    jobPath(job.id),
+    JSON.stringify(job, null, 2)
   );
 }
 
-function cleanName(
-  value
-) {
-
-  return String(
-    value ||
-    "Generated App"
-  )
-    .replace(
-      /[<>:"/\\|?*\x00-\x1F]/g,
-      ""
-    )
-    .trim()
-    .slice(
-      0,
-      80
-    ) ||
-    "Generated App";
-}
-
-function cleanVersion(
-  value
-) {
-
-  return String(
-    value ||
-    "1.0.0"
-  )
-    .replace(
-      /[^0-9A-Za-z._-]/g,
-      ""
-    )
-    .slice(
-      0,
-      30
-    ) ||
-    "1.0.0";
-}
-
-// ============================================================
-// MEMORY DIAGNOSTICS
-// ============================================================
-
-function memoryInfo() {
-
-  const mem =
-    process.memoryUsage();
-
-  return (
-    `RSS=${Math.round(
-      mem.rss / 1024 / 1024
-    )}MB ` +
-    `HeapUsed=${Math.round(
-      mem.heapUsed / 1024 / 1024
-    )}MB ` +
-    `HeapTotal=${Math.round(
-      mem.heapTotal / 1024 / 1024
-    )}MB ` +
-    `External=${Math.round(
-      mem.external / 1024 / 1024
-    )}MB`
-  );
-}
-
-function logSystemInfo(
-  job
-) {
-
-  log(
-    job.id,
-    `Node memory: ${memoryInfo()}`
-  );
+async function loadJob(id) {
+  const file = jobPath(id);
 
   try {
-
-    const load =
-      require("os").loadavg();
-
-    log(
-      job.id,
-      `Load average: ${load.join(", ")}`
-    );
-
-  } catch (error) {
-
-    log(
-      job.id,
-      `Could not read load average: ${
-        error.message
-      }`
-    );
+    const data = await fsp.readFile(file, "utf8");
+    return JSON.parse(data);
+  } catch {
+    return null;
   }
 }
 
+async function ensureDirectories() {
+  await fsp.mkdir(JOBS_DIR, { recursive: true });
+  await fsp.mkdir(BUILDS_DIR, { recursive: true });
+  await fsp.mkdir(WORKSPACES_DIR, { recursive: true });
+  await fsp.mkdir(GRADLE_CACHE_DIR, { recursive: true });
+}
+
+function renderDownloadUrl(req, id) {
+  const base =
+    process.env.RENDER_EXTERNAL_URL ||
+    `${req.protocol}://${req.get("host")}`;
+
+  return `${base}/api/download/${id}`;
+}
+
 // ============================================================
-// COPY TEMPLATE
+// PROCESS EXECUTION
 // ============================================================
 
-function copyTemplateForJob(
-  job
-) {
+function runProcess({
+  id,
+  command,
+  args,
+  cwd,
+  env,
+  timeout = BUILD_TIMEOUT
+}) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
 
-  const workspace =
-    path.join(
-      WORKSPACES_DIR,
-      job.id
-    );
+    log(id, `PROCESS START: ${command}`);
+    log(id, `ARGS: ${args.join(" ")}`);
+    log(id, `CWD: ${cwd}`);
 
-  log(
-    job.id,
-    `Creating isolated workspace: ${workspace}`
-  );
+    let child;
 
-  if (
-    fs.existsSync(workspace)
-  ) {
-
-    fs.rmSync(
-      workspace,
-      {
-        recursive: true,
-        force: true
-      }
-    );
-  }
-
-  fs.mkdirSync(
-    workspace,
-    {
-      recursive: true
+    try {
+      child = spawn(command, args, {
+        cwd,
+        env,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+    } catch (err) {
+      errorLog(id, `SPAWN EXCEPTION: ${err.stack || err}`);
+      reject(err);
+      return;
     }
-  );
 
-  // Node 20 supports fs.cpSync.
-  //
-  // We intentionally don't copy previous Gradle build
-  // outputs or the local .gradle directory.
+    log(id, `PROCESS CREATED. PID=${child.pid}`);
 
-  fs.cpSync(
-    TEMPLATE,
-    workspace,
-    {
-      recursive: true,
-      filter: (source) => {
+    let stdout = "";
+    let stderr = "";
 
-        const relative =
-          path.relative(
-            TEMPLATE,
-            source
-          );
+    let finished = false;
 
-        if (
-          !relative
-        ) {
-          return true;
-        }
+    const timer = setTimeout(() => {
+      if (finished) return;
 
-        const parts =
-          relative.split(
-            path.sep
-          );
+      errorLog(
+        id,
+        `PROCESS TIMEOUT after ${timeout}ms. Sending SIGTERM.`
+      );
 
-        if (
-          parts.includes(
-            ".gradle"
-          )
-        ) {
-          return false;
-        }
-
-        if (
-          parts.includes(
-            "build"
-          )
-        ) {
-          return false;
-        }
-
-        return true;
+      try {
+        child.kill("SIGTERM");
+      } catch (err) {
+        errorLog(
+          id,
+          `Unable to SIGTERM process: ${err.message}`
+        );
       }
-    }
-  );
 
-  log(
-    job.id,
-    "Android template copied successfully."
-  );
+      setTimeout(() => {
+        if (finished) return;
+
+        errorLog(
+          id,
+          "Process still alive after SIGTERM. Sending SIGKILL."
+        );
+
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }, 10000);
+    }, timeout);
+
+    child.stdout.on("data", (data) => {
+      const text = data.toString();
+      stdout += text;
+
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim()) {
+          console.log(`[GRADLE ${id}] ${line}`);
+        }
+      }
+    });
+
+    child.stderr.on("data", (data) => {
+      const text = data.toString();
+      stderr += text;
+
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim()) {
+          console.error(`[GRADLE-ERR ${id}] ${line}`);
+        }
+      }
+    });
+
+    child.on("error", (err) => {
+      if (finished) return;
+
+      finished = true;
+      clearTimeout(timer);
+
+      errorLog(
+        id,
+        `PROCESS ERROR: ${err.stack || err}`
+      );
+
+      reject(err);
+    });
+
+    child.on("exit", (code, signal) => {
+      log(
+        id,
+        `PROCESS EXIT: code=${code} signal=${signal || "none"}`
+      );
+    });
+
+    child.on("close", (code, signal) => {
+      if (finished) return;
+
+      finished = true;
+      clearTimeout(timer);
+
+      const duration = Date.now() - startedAt;
+
+      log(
+        id,
+        `PROCESS CLOSED: code=${code} signal=${signal || "none"} duration=${duration}ms`
+      );
+
+      if (code === 0) {
+        resolve({
+          code,
+          signal,
+          stdout,
+          stderr,
+          duration
+        });
+      } else {
+        const error = new Error(
+          `Process exited with code=${code}, signal=${signal || "none"}`
+        );
+
+        error.code = code;
+        error.signal = signal;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        error.duration = duration;
+
+        reject(error);
+      }
+    });
+  });
+}
+
+// ============================================================
+// TEMPLATE COPY
+// ============================================================
+
+async function createWorkspace(id) {
+  const workspace = path.join(WORKSPACES_DIR, id);
+
+  log(id, `Creating isolated workspace: ${workspace}`);
+
+  await fsp.rm(workspace, {
+    recursive: true,
+    force: true
+  });
+
+  await fsp.cp(TEMPLATE_DIR, workspace, {
+    recursive: true,
+    filter(source) {
+      const relative = path.relative(
+        TEMPLATE_DIR,
+        source
+      );
+
+      if (!relative) return true;
+
+      if (
+        relative === ".gradle" ||
+        relative.startsWith(".gradle" + path.sep)
+      ) {
+        return false;
+      }
+
+      if (
+        relative === "build" ||
+        relative.startsWith("build" + path.sep)
+      ) {
+        return false;
+      }
+
+      return true;
+    }
+  });
+
+  log(id, "Android template copied successfully.");
 
   return workspace;
 }
 
 // ============================================================
-// GRADLE
+// BUILD
 // ============================================================
 
-function runGradle(
-  job,
-  workspace
-) {
+async function processBuild(job) {
+  const id = job.id;
 
-  return new Promise(
-    (resolve, reject) => {
+  const startedAt = Date.now();
 
-      const start =
-        Date.now();
-
-      log(
-        job.id,
-        "========================================"
-      );
-
-      log(
-        job.id,
-        "GRADLE DIAGNOSTIC START"
-      );
-
-      log(
-        job.id,
-        "========================================"
-      );
-
-      logSystemInfo(
-        job
-      );
-
-      const gradlePath =
-        path.join(
-          workspace,
-          "gradlew"
-        );
-
-      log(
-        job.id,
-        `Gradle executable: ${gradlePath}`
-      );
-
-      log(
-        job.id,
-        `Gradle cwd: ${workspace}`
-      );
-
-      log(
-        job.id,
-        `Gradle timeout: ${GRADLE_TIMEOUT}ms`
-      );
-
-      log(
-        job.id,
-        "Step 1: verifying gradlew..."
-      );
-
-      if (
-        !fs.existsSync(
-          gradlePath
-        )
-      ) {
-
-        reject(
-          new Error(
-            `gradlew not found: ${gradlePath}`
-          )
-        );
-
-        return;
-      }
-
-      try {
-
-        fs.chmodSync(
-          gradlePath,
-          0o755
-        );
-
-      } catch (error) {
-
-        reject(
-          new Error(
-            `Unable to chmod gradlew: ${
-              error.message
-            }`
-          )
-        );
-
-        return;
-      }
-
-      log(
-        job.id,
-        "Step 2: gradlew exists and is executable."
-      );
-
-      const args = [
-        "assembleDebug",
-        "--no-daemon",
-        "--console=plain",
-        "--stacktrace",
-        "--max-workers=1"
-      ];
-
-      log(
-        job.id,
-        `Step 3: about to launch Gradle: ./gradlew ${args.join(
-          " "
-        )}`
-      );
-
-      log(
-        job.id,
-        `Step 4: cwd = ${workspace}`
-      );
-
-      log(
-        job.id,
-        `Step 5: GRADLE_USER_HOME = /builder/.gradle`
-      );
-
-      log(
-        job.id,
-        "Step 6: spawning Gradle process..."
-      );
-
-      let gradle;
-
-      try {
-
-        gradle =
-          spawn(
-            "./gradlew",
-            args,
-            {
-              cwd: workspace,
-
-              env: {
-                ...process.env,
-
-                GRADLE_USER_HOME:
-                  "/builder/.gradle",
-
-                JAVA_TOOL_OPTIONS:
-                  "-Xmx256m -XX:MaxMetaspaceSize=128m",
-
-                GRADLE_OPTS:
-                  "-Dorg.gradle.jvmargs=-Xmx256m -Dorg.gradle.daemon=false"
-              },
-
-              stdio: [
-                "ignore",
-                "pipe",
-                "pipe"
-              ]
-            }
-          );
-
-      } catch (error) {
-
-        console.error(
-          `[BUILD ${job.id}] spawn() THREW SYNCHRONOUSLY`
-        );
-
-        console.error(
-          error.stack || error
-        );
-
-        reject(error);
-
-        return;
-      }
-
-      log(
-        job.id,
-        "Step 7: Gradle child process CREATED."
-      );
-
-      log(
-        job.id,
-        `Gradle PID: ${gradle.pid || "unknown"}`
-      );
-
-      let stderr = "";
-      let stdout = "";
-
-      let settled = false;
-      let timedOut = false;
-
-      const timer =
-        setTimeout(
-          () => {
-
-            if (
-              settled
-            ) {
-              return;
-            }
-
-            timedOut = true;
-
-            console.error(
-              `[BUILD ${job.id}] GRADLE TIMEOUT`
-            );
-
-            log(
-              job.id,
-              `Gradle exceeded ${GRADLE_TIMEOUT}ms.`
-            );
-
-            try {
-
-              gradle.kill(
-                "SIGTERM"
-              );
-
-              log(
-                job.id,
-                "SIGTERM sent to Gradle."
-              );
-
-            } catch (error) {
-
-              console.error(
-                `[BUILD ${job.id}] Could not SIGTERM Gradle`
-              );
-
-              console.error(
-                error.stack || error
-              );
-            }
-
-            setTimeout(
-              () => {
-
-                if (
-                  settled
-                ) {
-                  return;
-                }
-
-                try {
-
-                  gradle.kill(
-                    "SIGKILL"
-                  );
-
-                  log(
-                    job.id,
-                    "SIGKILL sent to Gradle."
-                  );
-
-                } catch (error) {
-
-                  console.error(
-                    `[BUILD ${job.id}] Could not SIGKILL Gradle`
-                  );
-
-                  console.error(
-                    error.stack || error
-                  );
-                }
-
-              },
-              10000
-            );
-
-          },
-          GRADLE_TIMEOUT
-        );
-
-      // ------------------------------------------------------
-      // STDOUT
-      // ------------------------------------------------------
-
-      gradle.stdout.on(
-        "data",
-        (data) => {
-
-          const text =
-            data.toString();
-
-          stdout += text;
-
-          process.stdout.write(
-            `[GRADLE ${job.id}] ${text}`
-          );
-        }
-      );
-
-      // ------------------------------------------------------
-      // STDERR
-      // ------------------------------------------------------
-
-      gradle.stderr.on(
-        "data",
-        (data) => {
-
-          const text =
-            data.toString();
-
-          stderr += text;
-
-          process.stderr.write(
-            `[GRADLE-ERR ${job.id}] ${text}`
-          );
-        }
-      );
-
-      // ------------------------------------------------------
-      // SPAWN ERROR
-      // ------------------------------------------------------
-
-      gradle.on(
-        "error",
-        (error) => {
-
-          console.error(
-            `[BUILD ${job.id}] GRADLE PROCESS ERROR`
-          );
-
-          console.error(
-            error.stack || error
-          );
-
-          if (
-            !settled
-          ) {
-
-            settled = true;
-
-            clearTimeout(
-              timer
-            );
-
-            reject(
-              error
-            );
-          }
-        }
-      );
-
-      // ------------------------------------------------------
-      // EXIT
-      // ------------------------------------------------------
-
-      gradle.on(
-        "exit",
-        (code, signal) => {
-
-          log(
-            job.id,
-            `Gradle EXIT event: code=${code}, signal=${
-              signal || "none"
-            }`
-          );
-        }
-      );
-
-      // ------------------------------------------------------
-      // CLOSE
-      // ------------------------------------------------------
-
-      gradle.on(
-        "close",
-        (code, signal) => {
-
-          if (
-            settled
-          ) {
-            return;
-          }
-
-          settled = true;
-
-          clearTimeout(
-            timer
-          );
-
-          const seconds =
-            (
-              (Date.now() - start) /
-              1000
-            ).toFixed(1);
-
-          log(
-            job.id,
-            "========================================"
-          );
-
-          log(
-            job.id,
-            "GRADLE PROCESS CLOSED"
-          );
-
-          log(
-            job.id,
-            `Exit code: ${code}`
-          );
-
-          log(
-            job.id,
-            `Signal: ${signal || "none"}`
-          );
-
-          log(
-            job.id,
-            `Duration: ${seconds}s`
-          );
-
-          logSystemInfo(
-            job
-          );
-
-          if (
-            timedOut
-          ) {
-
-            reject(
-              new Error(
-                `Gradle build timed out after ${
-                  GRADLE_TIMEOUT
-                }ms.`
-              )
-            );
-
-            return;
-          }
-
-          if (
-            code !== 0
-          ) {
-
-            let details =
-              stderr.slice(
-                -15000
-              );
-
-            if (
-              !details.trim()
-            ) {
-              details =
-                stdout.slice(
-                  -15000
-                );
-            }
-
-            reject(
-              new Error(
-                `Gradle failed with exit code ${code}` +
-                `${
-                  signal
-                    ? `, signal ${signal}`
-                    : ""
-                }` +
-                `\n\n${details}`
-              )
-            );
-
-            return;
-          }
-
-          log(
-            job.id,
-            "Gradle build completed successfully."
-          );
-
-          resolve();
-        }
-      );
-    }
-  );
-}
-
-// ============================================================
-// ZIP
-// ============================================================
-
-function createZip(
-  job,
-  apkTarget,
-  zipPath,
-  buildDir
-) {
-
-  return new Promise(
-    (resolve, reject) => {
-
-      log(
-        job.id,
-        "Creating ZIP..."
-      );
-
-      log(
-        job.id,
-        `ZIP output: ${zipPath}`
-      );
-
-      const zip =
-        spawn(
-          "zip",
-          [
-            "-j",
-            zipPath,
-            apkTarget
-          ],
-          {
-            cwd: buildDir,
-            stdio: [
-              "ignore",
-              "pipe",
-              "pipe"
-            ]
-          }
-        );
-
-      let errorOutput = "";
-
-      log(
-        job.id,
-        `ZIP process PID: ${
-          zip.pid || "unknown"
-        }`
-      );
-
-      zip.stdout.on(
-        "data",
-        (data) => {
-
-          process.stdout.write(
-            `[ZIP ${job.id}] ${data}`
-          );
-        }
-      );
-
-      zip.stderr.on(
-        "data",
-        (data) => {
-
-          const text =
-            data.toString();
-
-          errorOutput += text;
-
-          process.stderr.write(
-            `[ZIP-ERR ${job.id}] ${text}`
-          );
-        }
-      );
-
-      zip.on(
-        "error",
-        (error) => {
-
-          console.error(
-            `[BUILD ${job.id}] ZIP PROCESS ERROR`
-          );
-
-          console.error(
-            error.stack || error
-          );
-
-          reject(error);
-        }
-      );
-
-      zip.on(
-        "exit",
-        (code, signal) => {
-
-          log(
-            job.id,
-            `ZIP exit: code=${code}, signal=${
-              signal || "none"
-            }`
-          );
-        }
-      );
-
-      zip.on(
-        "close",
-        (code) => {
-
-          if (
-            code !== 0
-          ) {
-
-            reject(
-              new Error(
-                `ZIP failed with code ${code}\n${errorOutput}`
-              )
-            );
-
-            return;
-          }
-
-          log(
-            job.id,
-            "ZIP created successfully."
-          );
-
-          resolve();
-        }
-      );
-    }
-  );
-}
-
-// ============================================================
-// CLEAN WORKSPACE
-// ============================================================
-
-function cleanupWorkspace(
-  job,
-  workspace
-) {
+  let workspace = null;
 
   try {
+    console.log("");
+    console.log("========================================");
+    log(id, "GABINAROU APK BUILD START");
+    log(id, `VERSION ${VERSION}`);
+    console.log("========================================");
 
-    if (
-      fs.existsSync(
-        workspace
-      )
-    ) {
+    log(id, `URL: ${job.url}`);
+    log(id, `Name: ${job.name}`);
+    log(id, `Package: ${job.packageName}`);
+    log(id, `Version: ${job.version}`);
+    log(id, `Icon: ${job.iconUrl || "(none)"}`);
 
-      fs.rmSync(
-        workspace,
-        {
-          recursive: true,
-          force: true
-        }
-      );
+    logMemory(id);
 
-      log(
-        job.id,
-        "Temporary workspace cleaned."
-      );
-    }
-
-  } catch (error) {
-
-    console.error(
-      `[BUILD ${job.id}] Workspace cleanup failed`
-    );
-
-    console.error(
-      error.stack || error
-    );
-  }
-}
-
-// ============================================================
-// BUILD PROCESS
-// ============================================================
-
-async function processBuild(
-  job
-) {
-
-  const start =
-    Date.now();
-
-  let workspace =
-    null;
-
-  try {
-
-    log(
-      job.id,
-      "========================================"
-    );
-
-    log(
-      job.id,
-      "GABINAROU APK BUILD START"
-    );
-
-    log(
-      job.id,
-      "VERSION 3.2.0"
-    );
-
-    log(
-      job.id,
-      "========================================"
-    );
-
-    log(
-      job.id,
-      `URL: ${job.url}`
-    );
-
-    log(
-      job.id,
-      `Name: ${job.name}`
-    );
-
-    log(
-      job.id,
-      `Package: ${job.packageName}`
-    );
-
-    log(
-      job.id,
-      `Version: ${job.versionName}`
-    );
-
-    log(
-      job.id,
-      `Icon: ${job.iconUrl || "(none)"}`
-    );
-
-    logSystemInfo(
-      job
-    );
-
-    updateJob(
-      job,
-      {
-        status:
-          "building",
-        progress:
-          10
-      }
-    );
+    job.status = "progress";
+    job.startedAt = now();
+    await saveJob(job);
 
     // --------------------------------------------------------
-    // TEMPLATE CHECK
+    // A
     // --------------------------------------------------------
 
-    log(
-      job.id,
-      "Step A: checking Android template..."
-    );
+    log(id, "Step A: checking Android template...");
 
-    if (
-      !fs.existsSync(
-        TEMPLATE
-      )
-    ) {
-
+    if (!fs.existsSync(TEMPLATE_DIR)) {
       throw new Error(
-        `Android template not found: ${TEMPLATE}`
+        `Android template not found: ${TEMPLATE_DIR}`
       );
     }
 
-    log(
-      job.id,
-      `Template found: ${TEMPLATE}`
-    );
-
-    updateJob(
-      job,
-      {
-        progress:
-          15
-      }
-    );
+    log(id, `Template found: ${TEMPLATE_DIR}`);
 
     // --------------------------------------------------------
-    // ISOLATED WORKSPACE
+    // B
     // --------------------------------------------------------
 
-    log(
-      job.id,
-      "Step B: creating isolated build workspace..."
-    );
+    log(id, "Step B: creating isolated build workspace...");
 
-    workspace =
-      copyTemplateForJob(
-        job
-      );
-
-    updateJob(
-      job,
-      {
-        progress:
-          20
-      }
-    );
+    workspace = await createWorkspace(id);
 
     // --------------------------------------------------------
-    // APP PROPERTIES
+    // C
     // --------------------------------------------------------
 
-    log(
-      job.id,
-      "Step C: writing app.properties..."
-    );
+    log(id, "Step C: writing app.properties...");
 
     const properties = [
       `app.url=${job.url}`,
@@ -1289,132 +410,108 @@ async function processBuild(
     ].join("\n") + "\n";
 
     const propertiesPath =
-      path.join(
-        workspace,
-        "app.properties"
-      );
+      path.join(workspace, "app.properties");
 
-    fs.writeFileSync(
+    await fsp.writeFile(
       propertiesPath,
-      properties
+      properties,
+      "utf8"
     );
 
     log(
-      job.id,
+      id,
       `app.properties written: ${propertiesPath}`
     );
 
-    log(
-      job.id,
-      "app.properties content:"
-    );
-
-    process.stdout.write(
-      properties
-    );
-
-    updateJob(
-      job,
-      {
-        progress:
-          25
-      }
+    console.log(
+      `[BUILD ${id}] app.properties content:\n${properties}`
     );
 
     // --------------------------------------------------------
-    // GRADLE CHECK
+    // D
     // --------------------------------------------------------
 
-    log(
-      job.id,
-      "Step D: checking Gradle wrapper..."
-    );
+    log(id, "Step D: checking Gradle installation...");
 
-    const gradlePath =
-      path.join(
-        workspace,
-        "gradlew"
-      );
-
-    if (
-      !fs.existsSync(
-        gradlePath
-      )
-    ) {
-
+    if (!fs.existsSync(GRADLE_BIN)) {
       throw new Error(
-        `gradlew not found: ${gradlePath}`
+        `Preinstalled Gradle not found: ${GRADLE_BIN}`
       );
     }
 
-    fs.chmodSync(
-      gradlePath,
-      0o755
-    );
-
-    log(
-      job.id,
-      "Gradle wrapper OK."
-    );
-
-    updateJob(
-      job,
-      {
-        progress:
-          30
-      }
-    );
+    log(id, `Gradle found: ${GRADLE_BIN}`);
 
     // --------------------------------------------------------
-    // GRADLE
+    // E
     // --------------------------------------------------------
 
-    log(
-      job.id,
-      "Step E: about to launch Gradle."
-    );
+    log(id, "Step E: checking Gradle version...");
 
-    log(
-      job.id,
-      "IMPORTANT: if the Render container dies now, the last visible log should be this step."
-    );
-
-    updateJob(
-      job,
-      {
-        progress:
-          35
-      }
-    );
-
-    await runGradle(
-      job,
-      workspace
-    );
-
-    log(
-      job.id,
-      "Step F: Gradle returned successfully."
-    );
-
-    updateJob(
-      job,
-      {
-        progress:
-          82
-      }
-    );
+    await runProcess({
+      id,
+      command: GRADLE_BIN,
+      args: ["--version"],
+      cwd: workspace,
+      env: {
+        ...process.env,
+        GRADLE_USER_HOME: GRADLE_CACHE_DIR,
+        JAVA_TOOL_OPTIONS,
+        GRADLE_OPTS
+      },
+      timeout: 60000
+    });
 
     // --------------------------------------------------------
-    // APK
+    // F
     // --------------------------------------------------------
 
+    log(id, "Step F: starting Android compilation.");
+
+    log(id, "IMPORTANT: Gradle is PREINSTALLED.");
+    log(id, "No Gradle distribution download should occur.");
+
+    logMemory(id);
+
+    const gradleArgs = [
+      "assembleDebug",
+      "--no-daemon",
+      "--console=plain",
+      "--stacktrace",
+      "--max-workers=1"
+    ];
+
+    console.log("========================================");
+    log(id, "GRADLE BUILD START");
+    console.log("========================================");
+
+    const gradleResult = await runProcess({
+      id,
+      command: GRADLE_BIN,
+      args: gradleArgs,
+      cwd: workspace,
+      env: {
+        ...process.env,
+        GRADLE_USER_HOME: GRADLE_CACHE_DIR,
+        JAVA_TOOL_OPTIONS,
+        GRADLE_OPTS
+      },
+      timeout: BUILD_TIMEOUT
+    });
+
     log(
-      job.id,
-      "Step G: locating APK..."
+      id,
+      `Gradle completed successfully in ${gradleResult.duration}ms`
     );
 
-    const apkSource =
+    logMemory(id);
+
+    // --------------------------------------------------------
+    // G
+    // --------------------------------------------------------
+
+    log(id, "Step G: searching for generated APK...");
+
+    const possibleApks = [
       path.join(
         workspace,
         "app",
@@ -1423,882 +520,616 @@ async function processBuild(
         "apk",
         "debug",
         "app-debug.apk"
-      );
-
-    log(
-      job.id,
-      `Expected APK: ${apkSource}`
-    );
-
-    if (
-      !fs.existsSync(
-        apkSource
+      ),
+      path.join(
+        workspace,
+        "app",
+        "build",
+        "outputs",
+        "apk",
+        "release",
+        "app-release.apk"
       )
-    ) {
+    ];
 
+    let apkSource = null;
+
+    for (const candidate of possibleApks) {
+      if (fs.existsSync(candidate)) {
+        apkSource = candidate;
+        break;
+      }
+    }
+
+    if (!apkSource) {
       throw new Error(
-        "Gradle finished successfully but app-debug.apk was not found."
+        "APK build finished but APK file was not found."
       );
     }
 
-    const apkSourceSize =
-      fs.statSync(
-        apkSource
-      ).size;
+    const apkName =
+      `${safeName(job.name, "app")}-${job.id}.apk`;
 
-    log(
-      job.id,
-      `Source APK size: ${apkSourceSize} bytes`
-    );
+    const apkDestination =
+      path.join(BUILDS_DIR, apkName);
 
-    // --------------------------------------------------------
-    // BUILD DIRECTORY
-    // --------------------------------------------------------
-
-    log(
-      job.id,
-      "Step H: creating output directory..."
-    );
-
-    const buildDir =
-      path.join(
-        BUILDS_DIR,
-        job.id
-      );
-
-    fs.mkdirSync(
-      buildDir,
-      {
-        recursive:
-          true
-      }
-    );
-
-    // --------------------------------------------------------
-    // COPY APK
-    // --------------------------------------------------------
-
-    const apkTarget =
-      path.join(
-        buildDir,
-        `${job.packageName}-debug.apk`
-      );
-
-    log(
-      job.id,
-      `Copying APK to: ${apkTarget}`
-    );
-
-    fs.copyFileSync(
+    await fsp.copyFile(
       apkSource,
-      apkTarget
+      apkDestination
     );
 
-    const apkSize =
-      fs.statSync(
-        apkTarget
-      ).size;
+    const apkStat =
+      await fsp.stat(apkDestination);
 
     log(
-      job.id,
-      `APK generated successfully. Size=${apkSize} bytes`
+      id,
+      `APK created: ${apkDestination}`
     );
 
-    updateJob(
-      job,
-      {
-        progress:
-          88
-      }
+    log(
+      id,
+      `APK size: ${Math.round(apkStat.size / 1024)} KB`
     );
 
     // --------------------------------------------------------
-    // ZIP
+    // H
     // --------------------------------------------------------
+
+    log(id, "Step H: creating ZIP package...");
 
     const zipName =
-      `${job.packageName}-${job.versionName}.zip`;
+      `${safeName(job.name, "app")}-${job.id}.zip`;
 
-    const zipPath =
-      path.join(
-        buildDir,
-        zipName
-      );
+    const zipDestination =
+      path.join(BUILDS_DIR, zipName);
 
-    log(
-      job.id,
-      "Step I: creating ZIP..."
-    );
-
-    await createZip(
-      job,
-      apkTarget,
-      zipPath,
-      buildDir
-    );
-
-    const zipSize =
-      fs.statSync(
-        zipPath
-      ).size;
+    const zipResult = await runProcess({
+      id,
+      command: "zip",
+      args: [
+        "-j",
+        zipDestination,
+        apkDestination
+      ],
+      cwd: BUILDS_DIR,
+      env: process.env,
+      timeout: 120000
+    });
 
     log(
-      job.id,
-      `ZIP size: ${zipSize} bytes`
+      id,
+      `ZIP process completed in ${zipResult.duration}ms`
     );
 
-    updateJob(
-      job,
-      {
-        progress:
-          95
-      }
+    const zipStat =
+      await fsp.stat(zipDestination);
+
+    log(
+      id,
+      `ZIP size: ${Math.round(zipStat.size / 1024)} KB`
     );
 
     // --------------------------------------------------------
-    // COMPLETE
+    // I
     // --------------------------------------------------------
 
-    const totalSeconds =
-      (
-        (Date.now() - start) /
-        1000
-      ).toFixed(1);
+    job.status = "completed";
 
-    const baseUrl =
-      process.env.RENDER_EXTERNAL_URL ||
-      `http://localhost:${PORT}`;
+    job.completedAt = now();
 
-    const downloadUrl =
-      `${baseUrl}/api/download/${job.id}`;
+    job.durationMs =
+      Date.now() - startedAt;
 
-    updateJob(
-      job,
-      {
-        status:
-          "completed",
+    job.apk = {
+      filename: apkName,
+      path: apkDestination,
+      size: apkStat.size
+    };
 
-        progress:
-          100,
+    job.zip = {
+      filename: zipName,
+      path: zipDestination,
+      size: zipStat.size
+    };
 
-        apk:
-          `${downloadUrl}?file=apk`,
+    await saveJob(job);
 
-        zip:
-          `${downloadUrl}?file=zip`,
+    console.log("========================================");
+    log(id, "BUILD COMPLETED SUCCESSFULLY");
+    log(id, `Duration: ${job.durationMs}ms`);
+    log(id, `APK: ${apkName}`);
+    log(id, `ZIP: ${zipName}`);
+    console.log("========================================");
 
-        downloadUrl,
-
-        buildSeconds:
-          Number(
-            totalSeconds
-          ),
-
-        error:
-          null
-      }
-    );
-
-    log(
-      job.id,
-      "========================================"
-    );
-
-    log(
-      job.id,
-      "BUILD COMPLETED"
-    );
-
-    log(
-      job.id,
-      `Duration: ${totalSeconds}s`
-    );
-
-    log(
-      job.id,
-      `APK: ${downloadUrl}?file=apk`
-    );
-
-    log(
-      job.id,
-      `ZIP: ${downloadUrl}?file=zip`
-    );
-
-    log(
-      job.id,
-      "========================================"
-    );
-
-    logSystemInfo(
-      job
-    );
-
-    return job;
+    logMemory(id);
 
   } catch (error) {
+    job.status = "failed";
+    job.completedAt = now();
+    job.durationMs =
+      Date.now() - startedAt;
 
-    const totalSeconds =
-      (
-        (Date.now() - start) /
-        1000
-      ).toFixed(1);
+    job.error = {
+      message: error.message,
+      code: error.code || null,
+      signal: error.signal || null,
+      stack: error.stack || null
+    };
 
-    console.error(
-      `[BUILD ${job.id}] ========================================`
-    );
-
-    console.error(
-      `[BUILD ${job.id}] BUILD FAILED`
-    );
-
-    console.error(
-      `[BUILD ${job.id}] Duration: ${totalSeconds}s`
-    );
-
-    console.error(
-      `[BUILD ${job.id}] Error:`
-    );
-
-    console.error(
-      error.stack || error
-    );
-
-    try {
-
-      updateJob(
-        job,
-        {
-          status:
-            "failed",
-
-          progress:
-            100,
-
-          error:
-            error.message ||
-            String(error),
-
-          buildSeconds:
-            Number(
-              totalSeconds
-            )
-        }
-      );
-
-    } catch (saveError) {
-
-      console.error(
-        `[BUILD ${job.id}] Could not save failed job`
-      );
-
-      console.error(
-        saveError.stack || saveError
-      );
+    if (error.stdout) {
+      job.error.stdout =
+        error.stdout.slice(-10000);
     }
 
-    return job;
+    if (error.stderr) {
+      job.error.stderr =
+        error.stderr.slice(-10000);
+    }
+
+    await saveJob(job);
+
+    console.error("");
+    console.error("========================================");
+    errorLog(id, "BUILD FAILED");
+    errorLog(id, error.stack || error);
+    console.error("========================================");
+
+    logMemory(id);
 
   } finally {
+    if (workspace) {
+      try {
+        await fsp.rm(workspace, {
+          recursive: true,
+          force: true
+        });
 
-    if (
-      workspace
-    ) {
-
-      cleanupWorkspace(
-        job,
-        workspace
-      );
+        log(
+          id,
+          "Build workspace cleaned."
+        );
+      } catch (cleanupError) {
+        errorLog(
+          id,
+          `Workspace cleanup failed: ${cleanupError.message}`
+        );
+      }
     }
-
-    log(
-      job.id,
-      `processBuild FINISHED. Final status=${job.status}`
-    );
   }
 }
 
 // ============================================================
-// ROOT
+// BUILD QUEUE
 // ============================================================
 
-app.get(
-  "/",
-  (req, res) => {
+function enqueueBuild(job) {
+  queuedBuilds++;
 
-    res.json({
-      success:
-        true,
+  const position = queuedBuilds;
 
-      service:
-        "gabinarou-webview-apk-builder",
+  log(
+    job.id,
+    `Build added to queue. Position=${position}`
+  );
 
-      version:
-        "3.2.0",
+  queue = queue
+    .then(async () => {
+      queuedBuilds--;
 
-      status:
-        "online"
+      await processBuild(job);
+    })
+    .catch((error) => {
+      console.error(
+        `[BUILD ${job.id}] QUEUE ERROR`,
+        error
+      );
     });
-  }
-);
+
+  return queue;
+}
 
 // ============================================================
 // HEALTH
 // ============================================================
 
-function healthResponse(
-  req,
-  res
-) {
+app.get("/health", async (req, res) => {
+  let gradleInstalled = false;
+
+  try {
+    gradleInstalled =
+      fs.existsSync(GRADLE_BIN);
+  } catch {}
 
   res.json({
-    success:
-      true,
-
-    service:
-      "gabinarou-webview-apk-builder",
-
-    version:
-      "3.2.0",
-
-    status:
-      "online",
-
-    time:
-      new Date().toISOString(),
-
-    memory:
-      memoryInfo(),
-
-    gradleTimeout:
-      GRADLE_TIMEOUT
+    success: true,
+    service: "gabinarou-webview-apk-builder",
+    version: VERSION,
+    status: "online",
+    time: now(),
+    gradle: {
+      installed: gradleInstalled,
+      version: "9.7.1",
+      path: GRADLE_BIN
+    },
+    build: {
+      timeoutMs: BUILD_TIMEOUT,
+      maxWorkers: 1
+    },
+    memory: memoryInfo(),
+    queue: queuedBuilds
   });
-}
+});
 
-app.get(
-  "/health",
-  healthResponse
-);
+// ============================================================
+// BUILDER INFO
+// ============================================================
 
-app.get(
-  "/api/health",
-  healthResponse
-);
+app.get("/builder", (req, res) => {
+  res.json({
+    success: true,
+    service: "Gabinarou WebView APK Builder",
+    version: VERSION,
+    status: "online",
+    endpoints: {
+      health: "/health",
+      build: "POST /api/build",
+      status: "GET /api/build/:id",
+      download: "GET /api/download/:id"
+    },
+    gradle: {
+      version: "9.7.1",
+      preinstalled: true
+    }
+  });
+});
+
+// ============================================================
+// TEMPLATE INFO
+// ============================================================
+
+app.get("/builder/template", async (req, res) => {
+  res.json({
+    success: true,
+    template: TEMPLATE_DIR,
+    exists: fs.existsSync(TEMPLATE_DIR),
+    gradle: {
+      version: "9.7.1",
+      executable: GRADLE_BIN,
+      exists: fs.existsSync(GRADLE_BIN)
+    }
+  });
+});
 
 // ============================================================
 // CREATE BUILD
 // ============================================================
 
-app.post(
-  "/api/build",
-  (req, res) => {
-
-    // --------------------------------------------------------
-    // API KEY
-    // --------------------------------------------------------
-
-    if (
-      API_KEY
-    ) {
-
-      const provided =
-        req.headers["x-api-key"] ||
-        req.headers.authorization?.replace(
-          /^Bearer\s+/i,
-          ""
-        );
-
-      if (
-        provided !==
-        API_KEY
-      ) {
-
-        return res
-          .status(401)
-          .json({
-            success:
-              false,
-
-            error:
-              "Unauthorized"
-          });
-      }
+app.post("/api/build", async (req, res) => {
+  try {
+    if (queuedBuilds >= MAX_QUEUE) {
+      return res.status(429).json({
+        success: false,
+        error: "Build queue is full."
+      });
     }
 
-    const body =
-      req.body || {};
+    const {
+      url,
+      name,
+      packageName,
+      version = "1.0.0",
+      iconUrl = ""
+    } = req.body || {};
 
-    // --------------------------------------------------------
-    // INPUTS
-    // --------------------------------------------------------
-
-    const url =
-      body.url ||
-      body.appUrl;
-
-    const name =
-      cleanName(
-        body.name ||
-        body.appName
-      );
-
-    const packageName =
-      body.packageName ||
-      body.packageId ||
-      "com.gabinarou.generatedapp";
-
-    const iconUrl =
-      body.iconUrl ||
-      "";
-
-    const versionName =
-      cleanVersion(
-        body.version ||
-        body.versionName
-      );
-
-    // --------------------------------------------------------
-    // URL
-    // --------------------------------------------------------
-
-    if (
-      !url ||
-      !validateUrl(url)
-    ) {
-
-      return res
-        .status(400)
-        .json({
-          success:
-            false,
-
-          error:
-            "A valid HTTPS URL is required."
-        });
+    if (!url) {
+      return res.status(400).json({
+        success: false,
+        error: "url is required"
+      });
     }
 
-    // --------------------------------------------------------
-    // PACKAGE
-    // --------------------------------------------------------
-
-    if (
-      !validatePackage(
-        packageName
-      )
-    ) {
-
-      return res
-        .status(400)
-        .json({
-          success:
-            false,
-
-          error:
-            "Invalid Android package name."
-        });
+    if (!isHttpsUrl(url)) {
+      return res.status(400).json({
+        success: false,
+        error: "url must use HTTPS"
+      });
     }
 
-    // --------------------------------------------------------
-    // ICON
-    // --------------------------------------------------------
-
-    if (
-      iconUrl &&
-      (
-        !iconUrl.startsWith(
-          "https://"
-        ) ||
-        iconUrl.includes(
-          "\n"
-        ) ||
-        iconUrl.includes(
-          "\r"
-        )
-      )
-    ) {
-
-      return res
-        .status(400)
-        .json({
-          success:
-            false,
-
-          error:
-            "iconUrl must be HTTPS."
-        });
+    if (!packageName) {
+      return res.status(400).json({
+        success: false,
+        error: "packageName is required"
+      });
     }
 
-    // --------------------------------------------------------
-    // JOB
-    // --------------------------------------------------------
+    if (!validPackageName(packageName)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid Android packageName"
+      });
+    }
 
-    const id =
-      makeId();
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        error: "name is required"
+      });
+    }
+
+    if (iconUrl && !isHttpsUrl(iconUrl)) {
+      return res.status(400).json({
+        success: false,
+        error: "iconUrl must use HTTPS"
+      });
+    }
+
+    const id = crypto
+      .randomBytes(12)
+      .toString("hex");
 
     const job = {
-
       id,
+      status: "queued",
 
-      status:
-        "queued",
-
-      progress:
-        5,
+      createdAt: now(),
 
       url,
-
-      name,
-
+      name: String(name).slice(0, 100),
       packageName,
-
+      version: String(version).slice(0, 30),
       iconUrl,
 
-      versionName,
-
-      createdAt:
-        new Date().toISOString(),
-
-      updatedAt:
-        new Date().toISOString(),
-
-      downloadUrl:
-        null,
-
-      apk:
-        null,
-
-      zip:
-        null,
-
-      error:
-        null
+      apk: null,
+      zip: null,
+      error: null
     };
 
-    saveJob(
-      job
-    );
+    await saveJob(job);
 
     console.log("");
+    console.log("========================================");
+    console.log(`NEW BUILD JOB: ${id}`);
+    console.log(`URL: ${url}`);
+    console.log(`PACKAGE: ${packageName}`);
+    console.log("========================================");
 
-    console.log(
-      "========================================"
+    enqueueBuild(job);
+
+    const statusUrl =
+      `/api/build/${id}`;
+
+    res.status(202).json({
+      success: true,
+      jobId: id,
+      status: "queued",
+      statusUrl
+    });
+
+  } catch (error) {
+    console.error(
+      "CREATE BUILD ERROR:",
+      error.stack || error
     );
 
-    console.log(
-      `NEW BUILD JOB: ${id}`
-    );
-
-    console.log(
-      `URL: ${url}`
-    );
-
-    console.log(
-      `PACKAGE: ${packageName}`
-    );
-
-    console.log(
-      "========================================"
-    );
-
-    // --------------------------------------------------------
-    // QUEUE
-    // --------------------------------------------------------
-
-    queueBuild(
-      job
-    )
-      .then(
-        () => {
-
-          console.log(
-            `[BUILD ${id}] processBuild FINISHED`
-          );
-        }
-      )
-      .catch(
-        (error) => {
-
-          console.error(
-            `[BUILD ${id}] QUEUED BUILD FAILED`
-          );
-
-          console.error(
-            error.stack || error
-          );
-        }
-      );
-
-    // --------------------------------------------------------
-    // RESPONSE
-    // --------------------------------------------------------
-
-    return res
-      .status(202)
-      .json({
-
-        success:
-          true,
-
-        jobId:
-          id,
-
-        status:
-          "queued",
-
-        statusUrl:
-          `/api/build/${id}`
-      });
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
-);
+});
 
 // ============================================================
 // BUILD STATUS
 // ============================================================
 
-app.get(
-  "/api/build/:id",
-  (req, res) => {
-
+app.get("/api/build/:id", async (req, res) => {
+  try {
     const job =
-      loadJob(
-        req.params.id
-      );
+      await loadJob(req.params.id);
 
-    if (
-      !job
-    ) {
-
-      return res
-        .status(404)
-        .json({
-          success:
-            false,
-
-          error:
-            "Build job not found"
-        });
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: "Build job not found"
+      });
     }
 
-    res.json({
-      success:
-        true,
+    const response = {
+      success: true,
+      jobId: job.id,
+      status: job.status,
+      createdAt: job.createdAt,
+      startedAt: job.startedAt || null,
+      completedAt: job.completedAt || null,
+      durationMs: job.durationMs || null
+    };
 
-      ...job
+    if (job.status === "completed") {
+      response.apk = {
+        filename: job.apk.filename,
+        size: job.apk.size,
+        downloadUrl:
+          renderDownloadUrl(
+            req,
+            job.id
+          )
+      };
+
+      response.zip = {
+        filename: job.zip.filename,
+        size: job.zip.size,
+        downloadUrl:
+          renderDownloadUrl(
+            req,
+            job.id
+          )
+      };
+    }
+
+    if (job.status === "failed") {
+      response.error = job.error;
+    }
+
+    res.json(response);
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
-);
+});
 
 // ============================================================
 // DOWNLOAD
 // ============================================================
 
-app.get(
-  "/api/download/:id",
-  (req, res) => {
-
+app.get("/api/download/:id", async (req, res) => {
+  try {
     const job =
-      loadJob(
-        req.params.id
-      );
+      await loadJob(req.params.id);
 
-    if (
-      !job
-    ) {
-
-      return res
-        .status(404)
-        .json({
-          success:
-            false,
-
-          error:
-            "Build job not found"
-        });
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: "Build job not found"
+      });
     }
 
-    if (
-      job.status !==
-      "completed"
-    ) {
-
-      return res
-        .status(409)
-        .json({
-          success:
-            false,
-
-          error:
-            "Build is not completed.",
-
-          status:
-            job.status,
-
-          progress:
-            job.progress
-        });
+    if (job.status !== "completed") {
+      return res.status(409).json({
+        success: false,
+        error: "Build is not completed yet.",
+        status: job.status
+      });
     }
 
-    const buildDir =
-      path.join(
-        BUILDS_DIR,
-        job.id
-      );
+    const requested =
+      req.query.file || "zip";
 
-    const apkPath =
-      path.join(
-        buildDir,
-        `${job.packageName}-debug.apk`
-      );
+    let filePath;
+    let filename;
 
-    const zipPath =
-      path.join(
-        buildDir,
-        `${job.packageName}-${job.versionName}.zip`
-      );
-
-    const file =
-      req.query.file ||
-      "zip";
-
-    // --------------------------------------------------------
-    // APK
-    // --------------------------------------------------------
-
-    if (
-      file === "apk"
-    ) {
-
-      if (
-        !fs.existsSync(
-          apkPath
-        )
-      ) {
-
-        return res
-          .status(404)
-          .json({
-            success:
-              false,
-
-            error:
-              "APK file not found."
-          });
-      }
-
-      return res.download(
-        apkPath,
-        `${job.name.replace(
-          /\s+/g,
-          "_"
-        )}.apk`
-      );
+    if (requested === "apk") {
+      filePath = job.apk.path;
+      filename = job.apk.filename;
+    } else {
+      filePath = job.zip.path;
+      filename = job.zip.filename;
     }
 
-    // --------------------------------------------------------
-    // ZIP
-    // --------------------------------------------------------
-
-    if (
-      !fs.existsSync(
-        zipPath
-      )
-    ) {
-
-      return res
-        .status(404)
-        .json({
-          success:
-            false,
-
-          error:
-            "ZIP file not found."
-        });
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        success: false,
+        error: "Build file no longer exists."
+      });
     }
 
-    return res.download(
-      zipPath,
-      `${job.name.replace(
-        /\s+/g,
-        "_"
-      )}.zip`
+    res.download(
+      filePath,
+      filename
     );
+
+  } catch (error) {
+    console.error(
+      "DOWNLOAD ERROR:",
+      error.stack || error
+    );
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
-);
+});
 
 // ============================================================
-// SERVER
+// GLOBAL ERROR HANDLERS
 // ============================================================
 
-app.listen(
-  PORT,
-  HOST,
-  () => {
+process.on("uncaughtException", (error) => {
+  console.error("");
+  console.error("========================================");
+  console.error("UNCAUGHT EXCEPTION");
+  console.error(error.stack || error);
+  console.error("========================================");
+});
 
+process.on("unhandledRejection", (reason) => {
+  console.error("");
+  console.error("========================================");
+  console.error("UNHANDLED REJECTION");
+  console.error(reason);
+  console.error("========================================");
+});
+
+process.on("SIGTERM", () => {
+  console.error(
+    `[${now()}] SIGTERM received.`
+  );
+});
+
+process.on("SIGINT", () => {
+  console.error(
+    `[${now()}] SIGINT received.`
+  );
+});
+
+process.on("exit", (code) => {
+  console.log(
+    `[${now()}] Node process exiting. code=${code}`
+  );
+});
+
+// ============================================================
+// START
+// ============================================================
+
+async function start() {
+  await ensureDirectories();
+
+  console.log("");
+  console.log("========================================");
+  console.log(`Gabinarou WebView APK Builder v${VERSION}`);
+  console.log("========================================");
+  console.log(`PORT: ${PORT}`);
+  console.log(`Host: ${HOST}`);
+  console.log("API: /api/build");
+  console.log("Health: /health");
+  console.log("Gradle: PREINSTALLED");
+  console.log("Gradle version: 9.7.1");
+  console.log(`Gradle path: ${GRADLE_BIN}`);
+  console.log("Gradle workers: 1");
+  console.log("Gradle JVM heap: 256MB");
+  console.log(`Build timeout: ${BUILD_TIMEOUT}ms`);
+  console.log("========================================");
+
+  if (fs.existsSync(GRADLE_BIN)) {
     console.log(
-      "========================================"
+      "✓ Preinstalled Gradle detected."
     );
-
-    console.log(
-      " Gabinarou WebView APK Builder v3.2"
-    );
-
-    console.log(
-      "========================================"
-    );
-
-    console.log(
-      `PORT: ${PORT}`
-    );
-
-    console.log(
-      `HOST: ${HOST}`
-    );
-
-    console.log(
-      "API: /api/build"
-    );
-
-    console.log(
-      "Health: /health"
-    );
-
-    console.log(
-      "Gradle logs: ENABLED"
-    );
-
-    console.log(
-      "Gradle workers: 1"
-    );
-
-    console.log(
-      "Gradle JVM heap: 256MB"
-    );
-
-    console.log(
-      `Gradle timeout: ${GRADLE_TIMEOUT}ms`
-    );
-
-    console.log(
-      "Build queue: SINGLE BUILD"
-    );
-
-    console.log(
-      "Isolated workspace: ENABLED"
-    );
-
-    console.log(
-      "========================================"
-    );
-
-    console.log(
-      "Service is ready."
-    );
-
-    console.log(
-      `Memory: ${memoryInfo()}`
-    );
-
-    console.log(
-      "========================================"
+  } else {
+    console.error(
+      "✗ WARNING: Preinstalled Gradle NOT FOUND."
     );
   }
-);
+
+  app.listen(PORT, HOST, () => {
+    console.log("");
+    console.log("Your service is live");
+    console.log(
+      process.env.RENDER_EXTERNAL_URL ||
+      `http://${HOST}:${PORT}`
+    );
+    console.log("");
+  });
+}
+
+start().catch((error) => {
+  console.error(
+    "FATAL STARTUP ERROR:",
+    error.stack || error
+  );
+
+  process.exit(1);
+});
