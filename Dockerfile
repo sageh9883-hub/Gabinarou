@@ -96,6 +96,8 @@ RUN mkdir -p \
 ENV NODE_ENV=production
 ENV PORT=10000
 ENV GRADLE_USER_HOME=/builder/.gradle
+ENV JAVA_TOOL_OPTIONS="-Xmx256m -XX:MaxMetaspaceSize=128m"
+ENV GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx256m -Dorg.gradle.daemon=false"
 
 EXPOSE 10000
 
