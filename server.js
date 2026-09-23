@@ -1,18 +1,16 @@
-"use strict";
-
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
-
 const fs = require("fs");
-const fsp = fs.promises;
+const fsp = require("fs/promises");
 const path = require("path");
-const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const os = require("os");
 
-const VERSION = "3.5.0";
+const app = express();
 
+const VERSION = "3.6.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = "0.0.0.0";
 
@@ -29,48 +27,130 @@ const GRADLE_BIN =
 const GRADLE_VERSION = "9.7.1";
 
 const BUILD_TIMEOUT =
-  Number(process.env.BUILD_TIMEOUT_MS) || 10 * 60 * 1000;
+  Number(process.env.BUILD_TIMEOUT_MS || 600000);
 
 const MAX_QUEUE =
-  Number(process.env.MAX_QUEUE) || 3;
+  Number(process.env.MAX_QUEUE || 3);
 
+/*
+ * IMPORTANT:
+ * Render Free = 512 MB.
+ *
+ * We intentionally keep the JVM small.
+ */
 const JAVA_TOOL_OPTIONS =
-  process.env.JAVA_TOOL_OPTIONS ||
-  "-Xmx256m -XX:MaxMetaspaceSize=128m";
+  "-Xms32m " +
+  "-Xmx160m " +
+  "-XX:MaxMetaspaceSize=64m " +
+  "-XX:ReservedCodeCacheSize=32m " +
+  "-XX:+UseSerialGC " +
+  "-XX:ActiveProcessorCount=1";
+
+const GRADLE_JVM_ARGS =
+  "-Xms32m " +
+  "-Xmx160m " +
+  "-XX:MaxMetaspaceSize=64m " +
+  "-XX:ReservedCodeCacheSize=32m " +
+  "-XX:+UseSerialGC " +
+  "-XX:ActiveProcessorCount=1";
 
 const GRADLE_OPTS =
-  process.env.GRADLE_OPTS ||
-  "-Dorg.gradle.jvmargs=-Xmx256m -Dorg.gradle.daemon=false";
+  "-Dorg.gradle.daemon=false " +
+  `-Dorg.gradle.jvmargs="${GRADLE_JVM_ARGS}" ` +
+  "-Dorg.gradle.parallel=false " +
+  "-Dorg.gradle.workers.max=1 " +
+  "-Dorg.gradle.caching=false " +
+  "-Dorg.gradle.configuration-cache=false " +
+  "-Dorg.gradle.vfs.watch=false " +
+  "-Dkotlin.compiler.execution.strategy=in-process " +
+  "-Dkotlin.daemon.enabled=false " +
+  "-Dfile.encoding=UTF-8";
 
-const app = express();
+const NODE_OPTIONS_VALUE =
+  "--max-old-space-size=96";
 
-app.use(helmet({
-  contentSecurityPolicy: false
-}));
+const jobs = new Map();
+
+let activeJob = null;
+let queuedBuilds = [];
+
+
+// ============================================================
+// EXPRESS
+// ============================================================
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false
+  })
+);
 
 app.use(cors());
 
 app.use(express.json({
-  limit: "2mb"
+  limit: "256kb"
 }));
 
-/* =========================================================
-   STATE
-========================================================= */
 
-const jobs = new Map();
+// ============================================================
+// REQUEST LOGGER
+// ============================================================
 
-let activeJobId = null;
-let queue = [];
+app.use((req, res, next) => {
+  const started = Date.now();
 
-const startedAt = Date.now();
+  const requestId =
+    req.headers["rndr-id"] ||
+    crypto.randomUUID();
 
-/* =========================================================
-   UTILITIES
-========================================================= */
+  res.setHeader("X-Request-ID", requestId);
+
+  res.on("finish", () => {
+    const duration = Date.now() - started;
+
+    console.log(
+      `[HTTP] ${req.method} ${req.originalUrl} ` +
+      `${res.statusCode} ${duration}ms ` +
+      `requestId=${requestId}`
+    );
+  });
+
+  next();
+});
+
+
+// ============================================================
+// HELPERS
+// ============================================================
 
 function now() {
   return new Date().toISOString();
+}
+
+function createId() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
+function safeName(value, fallback = "app") {
+  return String(value || fallback)
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || fallback;
+}
+
+function validatePackageName(value) {
+  return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/
+    .test(value);
+}
+
+function isHttpsUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function memoryMB() {
@@ -81,459 +161,568 @@ function memoryMB() {
     heapUsed: Math.round(m.heapUsed / 1024 / 1024),
     heapTotal: Math.round(m.heapTotal / 1024 / 1024),
     external: Math.round(m.external / 1024 / 1024),
-    arrayBuffers: Math.round((m.arrayBuffers || 0) / 1024 / 1024)
+    arrayBuffers: Math.round(m.arrayBuffers / 1024 / 1024)
   };
 }
 
-function cpuInfo() {
-  const usage = process.resourceUsage();
-
-  return {
-    loadAverage: os.loadavg(),
-    userCPUms: Math.round(usage.userCPUTime / 1000),
-    systemCPUms: Math.round(usage.systemCPUTime / 1000),
-    maxRSSMB: Math.round(usage.maxRSS / 1024)
-  };
-}
-
-function diskInfo(target = "/") {
+function readCgroupMemory() {
   try {
-    const stat = fs.statfsSync(target);
+    const currentPath =
+      "/sys/fs/cgroup/memory.current";
 
-    const total = Number(stat.blocks) * Number(stat.bsize);
-    const free = Number(stat.bfree) * Number(stat.bsize);
-    const available = Number(stat.bavail) * Number(stat.bsize);
+    const maxPath =
+      "/sys/fs/cgroup/memory.max";
+
+    const eventsPath =
+      "/sys/fs/cgroup/memory.events";
+
+    let currentMB = null;
+    let max = null;
+    let events = {};
+
+    if (fs.existsSync(currentPath)) {
+      const current =
+        Number(fs.readFileSync(currentPath, "utf8").trim());
+
+      if (Number.isFinite(current)) {
+        currentMB =
+          Math.round(current / 1024 / 1024);
+      }
+    }
+
+    if (fs.existsSync(maxPath)) {
+      max =
+        fs.readFileSync(maxPath, "utf8").trim();
+
+      if (max !== "max") {
+        const n = Number(max);
+
+        if (Number.isFinite(n)) {
+          max =
+            Math.round(n / 1024 / 1024) + "MB";
+        }
+      }
+    }
+
+    if (fs.existsSync(eventsPath)) {
+      const lines =
+        fs.readFileSync(eventsPath, "utf8")
+          .trim()
+          .split("\n");
+
+      for (const line of lines) {
+        const [key, value] = line.split(/\s+/);
+
+        if (key) {
+          events[key] = Number(value);
+        }
+      }
+    }
+
+    return {
+      memoryCurrentMB: currentMB,
+      memoryMax: max,
+      memoryEvents: events
+    };
+
+  } catch (error) {
+    return {
+      error: error.message
+    };
+  }
+}
+
+function diskInfo() {
+  try {
+    const stat = fs.statfsSync("/");
+
+    const total =
+      Number(stat.blocks) *
+      Number(stat.bsize);
+
+    const free =
+      Number(stat.bfree) *
+      Number(stat.bsize);
+
+    const available =
+      Number(stat.bavail) *
+      Number(stat.bsize);
+
     const used = total - free;
 
     return {
-      path: target,
       totalMB: Math.round(total / 1024 / 1024),
       usedMB: Math.round(used / 1024 / 1024),
       freeMB: Math.round(free / 1024 / 1024),
-      availableMB: Math.round(available / 1024 / 1024)
+      availableMB: Math.round(
+        available / 1024 / 1024
+      )
     };
-  } catch (err) {
+
+  } catch (error) {
     return {
-      path: target,
-      error: err.message
+      error: error.message
     };
   }
-}
-
-function readFileSafe(file) {
-  try {
-    return fs.readFileSync(file, "utf8");
-  } catch {
-    return null;
-  }
-}
-
-function cgroupInfo() {
-  const result = {};
-
-  const memoryCurrent =
-    readFileSafe("/sys/fs/cgroup/memory.current");
-
-  const memoryMax =
-    readFileSafe("/sys/fs/cgroup/memory.max");
-
-  const memoryEvents =
-    readFileSafe("/sys/fs/cgroup/memory.events");
-
-  if (memoryCurrent) {
-    const n = Number(memoryCurrent.trim());
-
-    if (Number.isFinite(n)) {
-      result.memoryCurrentMB =
-        Math.round(n / 1024 / 1024);
-    }
-  }
-
-  if (memoryMax) {
-    const value = memoryMax.trim();
-
-    result.memoryMax =
-      value === "max"
-        ? "max"
-        : `${Math.round(Number(value) / 1024 / 1024)}MB`;
-  }
-
-  if (memoryEvents) {
-    result.memoryEvents = {};
-
-    for (const line of memoryEvents.trim().split("\n")) {
-      const parts = line.trim().split(/\s+/);
-
-      if (parts.length === 2) {
-        result.memoryEvents[parts[0]] =
-          Number(parts[1]);
-      }
-    }
-  }
-
-  return result;
 }
 
 function systemDiagnostics() {
   return {
-    timestamp: now(),
-    uptimeSeconds: Math.round(process.uptime()),
     node: process.version,
     pid: process.pid,
-    platform: process.platform,
-    arch: process.arch,
-    hostname: os.hostname(),
-
+    uptimeSeconds: Math.round(process.uptime()),
     memory: memoryMB(),
-    cpu: cpuInfo(),
-
-    disk: {
-      root: diskInfo("/"),
-      builder: diskInfo(ROOT)
-    },
-
-    cgroup: cgroupInfo()
+    cpu: os.loadavg(),
+    disk: diskInfo(),
+    cgroup: readCgroupMemory()
   };
 }
 
-function logSystem(prefix = "[SYSTEM]") {
-  const d = systemDiagnostics();
+function jobDir(jobId) {
+  return path.join(JOBS_DIR, jobId);
+}
 
-  console.log(
-    `${prefix} uptime=${d.uptimeSeconds}s ` +
-    `rss=${d.memory.rss}MB ` +
-    `heap=${d.memory.heapUsed}/${d.memory.heapTotal}MB ` +
-    `cpu=${JSON.stringify(d.cpu.loadAverage)} ` +
-    `diskFree=${d.disk.root.freeMB}MB ` +
-    `cgroup=${JSON.stringify(d.cgroup)}`
+function jobFile(jobId) {
+  return path.join(
+    jobDir(jobId),
+    "job.json"
   );
 }
 
-function jobPath(id) {
-  return path.join(JOBS_DIR, id);
+function logFile(jobId) {
+  return path.join(
+    jobDir(jobId),
+    "build.log"
+  );
 }
 
-function jobJsonPath(id) {
-  return path.join(jobPath(id), "job.json");
-}
-
-function jobLogPath(id) {
-  return path.join(jobPath(id), "build.log");
-}
-
-async function ensureDirs() {
-  await fsp.mkdir(JOBS_DIR, { recursive: true });
-  await fsp.mkdir(BUILDS_DIR, { recursive: true });
-  await fsp.mkdir(WORKSPACES_DIR, { recursive: true });
-}
-
-async function saveJob(job) {
-  jobs.set(job.id, job);
-
-  await fsp.mkdir(jobPath(job.id), {
+async function ensureDirectories() {
+  await fsp.mkdir(JOBS_DIR, {
     recursive: true
   });
 
-  await fsp.writeFile(
-    jobJsonPath(job.id),
-    JSON.stringify(job, null, 2)
-  );
+  await fsp.mkdir(BUILDS_DIR, {
+    recursive: true
+  });
+
+  await fsp.mkdir(WORKSPACES_DIR, {
+    recursive: true
+  });
 }
 
-async function appendJobLog(job, message) {
+async function saveJob(job) {
+  try {
+    await fsp.mkdir(
+      jobDir(job.id),
+      { recursive: true }
+    );
+
+    await fsp.writeFile(
+      jobFile(job.id),
+      JSON.stringify(job, null, 2),
+      "utf8"
+    );
+
+  } catch (error) {
+    console.error(
+      `[JOB ${job.id}] saveJob error:`,
+      error.message
+    );
+  }
+}
+
+function appendJobLog(job, message) {
   const line =
     `[${now()}] ${message}`;
 
   console.log(line);
 
-  try {
-    await fsp.appendFile(
-      jobLogPath(job.id),
-      line + "\n"
+  if (job) {
+    const file = logFile(job.id);
+
+    fs.mkdir(
+      path.dirname(file),
+      { recursive: true },
+      (mkdirError) => {
+        if (mkdirError) return;
+
+        fs.appendFile(
+          file,
+          line + "\n",
+          "utf8",
+          () => {}
+        );
+      }
     );
-  } catch (err) {
+  }
+}
+
+function updateJob(job, patch) {
+  Object.assign(job, patch, {
+    updatedAt: now()
+  });
+
+  jobs.set(job.id, job);
+
+  saveJob(job).catch(() => {});
+}
+
+function getPublicBaseUrl(req) {
+  return (
+    process.env.RENDER_EXTERNAL_URL ||
+    `${req.protocol}://${req.get("host")}`
+  );
+}
+
+function sleep(ms) {
+  return new Promise(resolve =>
+    setTimeout(resolve, ms)
+  );
+}
+
+
+// ============================================================
+// MEMORY GUARD
+// ============================================================
+
+function startMemoryGuard(job, child) {
+  let stopped = false;
+  let interval = null;
+  let highCount = 0;
+  let warned = false;
+
+  interval = setInterval(() => {
+    if (stopped) return;
+
+    const cg = readCgroupMemory();
+    const current = cg.memoryCurrentMB;
+
+    if (!Number.isFinite(current)) {
+      return;
+    }
+
+    appendJobLog(
+      job,
+      `MEMORY current=${current}MB ` +
+      `max=${cg.memoryMax} ` +
+      `events=${JSON.stringify(cg.memoryEvents)}`
+    );
+
+    /*
+     * Warning zone.
+     */
+    if (current >= 450 && !warned) {
+      warned = true;
+
+      appendJobLog(
+        job,
+        `WARNING: memory pressure detected at ${current}MB.`
+      );
+    }
+
+    /*
+     * Emergency zone.
+     *
+     * We deliberately stop before Render's 512MB
+     * hard limit.
+     */
+    if (current >= 485) {
+      highCount++;
+
+      appendJobLog(
+        job,
+        `HIGH MEMORY ${current}MB ` +
+        `(${highCount}/2)`
+      );
+
+      if (highCount >= 2) {
+        appendJobLog(
+          job,
+          `MEMORY GUARD: stopping Gradle before cgroup limit.`
+        );
+
+        killProcessTree(child);
+
+        updateJob(job, {
+          status: "failed",
+          error:
+            `Build stopped because container memory ` +
+            `reached ${current}MB of ${cg.memoryMax}.`
+        });
+
+        stop();
+
+        return;
+      }
+
+    } else {
+      highCount = 0;
+    }
+
+  }, 2000);
+
+  function stop() {
+    stopped = true;
+
+    if (interval) {
+      clearInterval(interval);
+      interval = null;
+    }
+  }
+
+  return stop;
+}
+
+
+// ============================================================
+// PROCESS MANAGEMENT
+// ============================================================
+
+function killProcessTree(child) {
+  if (!child || !child.pid) {
+    return;
+  }
+
+  const pid = child.pid;
+
+  try {
+    /*
+     * detached=true means the child is the process-group
+     * leader. Negative PID kills the complete group.
+     */
+    process.kill(-pid, "SIGTERM");
+
     console.error(
-      `[JOB ${job.id}] Cannot write build.log:`,
-      err.message
+      `[PROCESS] SIGTERM process group ${pid}`
     );
+
+  } catch (error) {
+    try {
+      child.kill("SIGTERM");
+
+      console.error(
+        `[PROCESS] SIGTERM child ${pid}:`,
+        error.message
+      );
+
+    } catch (error2) {
+      console.error(
+        `[PROCESS] Unable to terminate ${pid}:`,
+        error2.message
+      );
+    }
   }
+
+  setTimeout(() => {
+    try {
+      process.kill(-pid, "SIGKILL");
+
+      console.error(
+        `[PROCESS] SIGKILL process group ${pid}`
+      );
+
+    } catch {
+      try {
+        if (!child.killed) {
+          child.kill("SIGKILL");
+        }
+      } catch {}
+    }
+  }, 3000);
 }
 
-async function updateJob(job, patch) {
-  Object.assign(job, patch);
 
-  job.updatedAt = now();
-
-  await saveJob(job);
-}
-
-function validatePackageName(name) {
-  return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$/.test(name);
-}
-
-function validateHttpsUrl(url) {
-  try {
-    const u = new URL(url);
-
-    return u.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
-async function fileExists(file) {
-  try {
-    await fsp.access(file);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/* =========================================================
-   PROCESS RUNNER
-========================================================= */
-
-function runProcess(job, command, args, options = {}) {
+function runProcess(
+  job,
+  command,
+  args,
+  options = {}
+) {
   return new Promise((resolve, reject) => {
-    const timeout =
-      options.timeout || BUILD_TIMEOUT;
-
-    const started = Date.now();
 
     appendJobLog(
       job,
       `PROCESS START: ${command} ${args.join(" ")}`
-    ).catch(() => {});
-
-    console.log(
-      `[JOB ${job.id}] Spawning process`
     );
 
-    console.log(
-      `[JOB ${job.id}] command=${command}`
-    );
+    const env = {
+      ...process.env,
 
-    console.log(
-      `[JOB ${job.id}] cwd=${options.cwd || process.cwd()}`
-    );
+      NODE_OPTIONS: NODE_OPTIONS_VALUE,
 
-    console.log(
-      `[JOB ${job.id}] timeout=${timeout}ms`
-    );
+      JAVA_TOOL_OPTIONS:
+        JAVA_TOOL_OPTIONS,
 
-    let child;
+      GRADLE_OPTS:
+        GRADLE_OPTS,
 
-    try {
-      child = spawn(command, args, {
-        cwd: options.cwd || process.cwd(),
-        env: {
-          ...process.env,
+      GRADLE_USER_HOME:
+        "/builder/.gradle",
 
-          GRADLE_USER_HOME:
-            "/builder/.gradle",
+      /*
+       * Prevent Gradle from thinking many CPUs exist.
+       */
+      JAVA_HOME:
+        process.env.JAVA_HOME ||
+        "/usr/lib/jvm/java-17-openjdk-amd64"
+    };
 
-          JAVA_TOOL_OPTIONS,
-
-          GRADLE_OPTS,
-
-          CI: "true"
-        },
-
+    const child = spawn(
+      command,
+      args,
+      {
+        cwd: options.cwd,
+        env,
+        shell: false,
+        detached: true,
         stdio: [
           "ignore",
           "pipe",
           "pipe"
         ]
-      });
-    } catch (err) {
-      appendJobLog(
-        job,
-        `SPAWN EXCEPTION: ${err.stack || err}`
-      ).catch(() => {});
-
-      reject(err);
-      return;
-    }
-
-    console.log(
-      `[JOB ${job.id}] PROCESS CREATED pid=${child.pid}`
+      }
     );
-
-    appendJobLog(
-      job,
-      `PROCESS CREATED pid=${child.pid}`
-    ).catch(() => {});
-
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-
-    child.stdout.on("data", chunk => {
-      stdoutBytes += chunk.length;
-
-      const text = chunk.toString();
-
-      process.stdout.write(
-        `[GRADLE ${job.id}] ${text}`
-      );
-
-      fsp.appendFile(
-        jobLogPath(job.id),
-        text
-      ).catch(() => {});
-    });
-
-    child.stderr.on("data", chunk => {
-      stderrBytes += chunk.length;
-
-      const text = chunk.toString();
-
-      process.stderr.write(
-        `[GRADLE-ERR ${job.id}] ${text}`
-      );
-
-      fsp.appendFile(
-        jobLogPath(job.id),
-        text
-      ).catch(() => {});
-    });
 
     let finished = false;
     let timedOut = false;
 
-    const timer = setTimeout(() => {
+    let memoryGuardStop = null;
+
+    const timeout = setTimeout(() => {
       if (finished) return;
 
       timedOut = true;
 
       appendJobLog(
         job,
-        `TIMEOUT after ${timeout}ms - sending SIGTERM to PID ${child.pid}`
-      ).catch(() => {});
-
-      console.error(
-        `[JOB ${job.id}] TIMEOUT PID=${child.pid}`
+        `PROCESS TIMEOUT after ${BUILD_TIMEOUT}ms`
       );
 
-      try {
-        child.kill("SIGTERM");
-      } catch {}
+      killProcessTree(child);
 
-      setTimeout(() => {
-        if (!finished) {
-          try {
-            child.kill("SIGKILL");
-          } catch {}
+    }, BUILD_TIMEOUT);
+
+    memoryGuardStop =
+      startMemoryGuard(job, child);
+
+    appendJobLog(
+      job,
+      `PROCESS CREATED pid=${child.pid}`
+    );
+
+    child.stdout.on(
+      "data",
+      data => {
+        const text =
+          data.toString();
+
+        for (const line of text.split(/\r?\n/)) {
+          if (line.trim()) {
+            appendJobLog(
+              job,
+              `[PROCESS] ${line}`
+            );
+          }
         }
-      }, 10000);
-
-    }, timeout);
-
-    child.on("error", err => {
-      console.error(
-        `[JOB ${job.id}] CHILD ERROR`,
-        err
-      );
-
-      appendJobLog(
-        job,
-        `CHILD ERROR: ${err.stack || err}`
-      ).catch(() => {});
-
-      if (!finished) {
-        finished = true;
-        clearTimeout(timer);
-        reject(err);
       }
-    });
+    );
 
-    child.on("exit", (code, signal) => {
-      console.log(
-        `[JOB ${job.id}] PROCESS EXIT ` +
-        `code=${code} signal=${signal}`
-      );
+    child.stderr.on(
+      "data",
+      data => {
+        const text =
+          data.toString();
 
-      appendJobLog(
-        job,
-        `PROCESS EXIT code=${code} signal=${signal}`
-      ).catch(() => {});
-    });
+        for (const line of text.split(/\r?\n/)) {
+          if (line.trim()) {
+            appendJobLog(
+              job,
+              `[PROCESS-ERR] ${line}`
+            );
+          }
+        }
+      }
+    );
 
-    child.on("close", (code, signal) => {
-      if (finished) return;
+    child.on(
+      "error",
+      error => {
+        appendJobLog(
+          job,
+          `PROCESS ERROR: ${error.stack || error}`
+        );
+      }
+    );
 
-      finished = true;
+    child.on(
+      "exit",
+      (code, signal) => {
+        appendJobLog(
+          job,
+          `PROCESS EXIT code=${code} signal=${signal}`
+        );
+      }
+    );
 
-      clearTimeout(timer);
+    child.on(
+      "close",
+      (code, signal) => {
+        if (finished) return;
 
-      const duration =
-        Date.now() - started;
+        finished = true;
 
-      console.log(
-        `[JOB ${job.id}] PROCESS CLOSE ` +
-        `code=${code} signal=${signal} ` +
-        `duration=${duration}ms`
-      );
+        clearTimeout(timeout);
 
-      appendJobLog(
-        job,
-        `PROCESS CLOSE code=${code} signal=${signal} duration=${duration}ms stdout=${stdoutBytes}B stderr=${stderrBytes}B`
-      ).catch(() => {});
+        if (memoryGuardStop) {
+          memoryGuardStop();
+        }
 
-      resolve({
-        code,
-        signal,
-        duration,
-        stdoutBytes,
-        stderrBytes,
-        timedOut
-      });
-    });
+        appendJobLog(
+          job,
+          `PROCESS CLOSE code=${code} signal=${signal}`
+        );
+
+        if (timedOut) {
+          reject(
+            new Error(
+              `Process timeout after ${BUILD_TIMEOUT}ms`
+            )
+          );
+
+          return;
+        }
+
+        if (code !== 0) {
+          reject(
+            new Error(
+              `Process exited with code ${code}` +
+              (signal
+                ? ` signal ${signal}`
+                : "")
+            )
+          );
+
+          return;
+        }
+
+        resolve({
+          code,
+          signal
+        });
+      }
+    );
   });
 }
 
-/* =========================================================
-   BUILD MONITOR
-========================================================= */
 
-function startBuildMonitor(job) {
-  console.log(
-    `[JOB ${job.id}] Starting build monitor`
-  );
-
-  return setInterval(async () => {
-    try {
-      if (activeJobId !== job.id) return;
-
-      const d = systemDiagnostics();
-
-      const line =
-        `HEARTBEAT ` +
-        `pid=${process.pid} ` +
-        `rss=${d.memory.rss}MB ` +
-        `heap=${d.memory.heapUsed}MB ` +
-        `cpuLoad=${d.cpu.loadAverage.join(",")} ` +
-        `diskFree=${d.disk.root.freeMB}MB ` +
-        `cgroup=${JSON.stringify(d.cgroup)}`;
-
-      await appendJobLog(job, line);
-
-    } catch (err) {
-      console.error(
-        `[JOB ${job.id}] Monitor error:`,
-        err.message
-      );
-    }
-  }, 5000);
-}
-
-/* =========================================================
-   TEMPLATE
-========================================================= */
+// ============================================================
+// TEMPLATE
+// ============================================================
 
 async function copyTemplate(destination) {
-  console.log(
-    `[COPY] Copying template -> ${destination}`
+  appendJobLog(
+    null,
+    `Copying template to ${destination}`
   );
 
   await fsp.cp(
@@ -542,22 +731,23 @@ async function copyTemplate(destination) {
     {
       recursive: true,
       filter(source) {
-        const relative =
-          path.relative(
-            TEMPLATE_DIR,
-            source
-          );
+        const normalized =
+          source.replace(/\\/g, "/");
 
         if (
-          relative === ".gradle" ||
-          relative.startsWith(".gradle" + path.sep)
+          normalized.includes("/.gradle/")
         ) {
           return false;
         }
 
         if (
-          relative === "build" ||
-          relative.startsWith("build" + path.sep)
+          normalized.includes("/build/")
+        ) {
+          return false;
+        }
+
+        if (
+          normalized.endsWith("/build")
         ) {
           return false;
         }
@@ -566,22 +756,81 @@ async function copyTemplate(destination) {
       }
     }
   );
+}
 
-  console.log(
-    `[COPY] Template copied successfully`
+async function writeGradleProperties(workspace) {
+  const gradleDir =
+    path.join(workspace, ".gradle");
+
+  /*
+   * Project-local Gradle properties.
+   *
+   * These make the daemon/workers settings explicit
+   * instead of relying only on environment variables.
+   */
+  const properties = [
+    "org.gradle.daemon=false",
+    "org.gradle.parallel=false",
+    "org.gradle.workers.max=1",
+    "org.gradle.caching=false",
+    "org.gradle.configuration-cache=false",
+    "org.gradle.vfs.watch=false",
+    "org.gradle.jvmargs=" +
+      GRADLE_JVM_ARGS,
+    "kotlin.compiler.execution.strategy=in-process",
+    "kotlin.daemon.enabled=false",
+    "android.builder.sdkDownload=false"
+  ].join("\n") + "\n";
+
+  await fsp.mkdir(
+    gradleDir,
+    { recursive: true }
+  );
+
+  await fsp.writeFile(
+    path.join(
+      workspace,
+      "gradle.properties"
+    ),
+    properties,
+    "utf8"
   );
 }
 
-/* =========================================================
-   BUILD
-========================================================= */
+async function writeAppProperties(
+  workspace,
+  job
+) {
+  const properties = [
+    `app.url=${job.url}`,
+    `app.package=${job.packageName}`,
+    `app.name=${job.name}`,
+    job.iconUrl
+      ? `app.icon_url=${job.iconUrl}`
+      : "",
+    `app.version=${job.version || "1.0.0"}`
+  ]
+    .filter(Boolean)
+    .join("\n") + "\n";
+
+  await fsp.writeFile(
+    path.join(
+      workspace,
+      "app.properties"
+    ),
+    properties,
+    "utf8"
+  );
+}
+
+
+// ============================================================
+// BUILD
+// ============================================================
 
 async function processBuild(job) {
-  const buildStarted = Date.now();
 
-  activeJobId = job.id;
-
-  let monitor = null;
+  activeJob = job.id;
 
   const workspace =
     path.join(
@@ -589,500 +838,454 @@ async function processBuild(job) {
       job.id
     );
 
-  const properties =
+  const apkSource =
     path.join(
       workspace,
-      "app.properties"
+      "app",
+      "build",
+      "outputs",
+      "apk",
+      "debug",
+      "app-debug.apk"
+    );
+
+  const finalApk =
+    path.join(
+      BUILDS_DIR,
+      `${safeName(job.name)}-${job.id}.apk`
+    );
+
+  const finalZip =
+    path.join(
+      BUILDS_DIR,
+      `${safeName(job.name)}-${job.id}.zip`
     );
 
   try {
-    await appendJobLog(
+
+    appendJobLog(
       job,
-      "========================================"
+      "=================================================="
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `BUILD START V${VERSION}`
+      `BUILD ${VERSION} START`
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `JOB ID: ${job.id}`
+      `Job: ${job.id}`
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
       `URL: ${job.url}`
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `APP NAME: ${job.name}`
+      `Package: ${job.packageName}`
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `PACKAGE: ${job.packageName}`
+      `Name: ${job.name}`
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `VERSION: ${job.version}`
+      `Gradle: ${GRADLE_BIN}`
     );
 
-    await updateJob(job, {
+    appendJobLog(
+      job,
+      `Java options: ${JAVA_TOOL_OPTIONS}`
+    );
+
+    appendJobLog(
+      job,
+      `Gradle options: ${GRADLE_OPTS}`
+    );
+
+    appendJobLog(
+      job,
+      `Initial diagnostics: ${JSON.stringify(
+        systemDiagnostics()
+      )}`
+    );
+
+
+    // --------------------------------------------------------
+    // STEP 1
+    // --------------------------------------------------------
+
+    updateJob(job, {
       status: "building",
-      startedAt: now(),
-      workspace
+      step: "Preparing workspace"
     });
 
-    monitor = startBuildMonitor(job);
-
-    /* -----------------------------------------
-       SYSTEM
-    ----------------------------------------- */
-
-    await appendJobLog(
+    appendJobLog(
       job,
-      `SYSTEM: Node ${process.version}`
+      "STEP 1/10: Preparing isolated workspace."
     );
 
-    await appendJobLog(
-      job,
-      `SYSTEM: PID ${process.pid}`
+    await fsp.rm(
+      workspace,
+      {
+        recursive: true,
+        force: true
+      }
     );
-
-    await appendJobLog(
-      job,
-      `SYSTEM: platform=${process.platform} arch=${process.arch}`
-    );
-
-    await appendJobLog(
-      job,
-      `SYSTEM: memory=${JSON.stringify(memoryMB())}`
-    );
-
-    await appendJobLog(
-      job,
-      `SYSTEM: disk=${JSON.stringify(diskInfo("/"))}`
-    );
-
-    await appendJobLog(
-      job,
-      `SYSTEM: cgroup=${JSON.stringify(cgroupInfo())}`
-    );
-
-    /* -----------------------------------------
-       WORKSPACE
-    ----------------------------------------- */
-
-    await appendJobLog(
-      job,
-      "STEP 1/10: Creating workspace"
-    );
-
-    await fsp.rm(workspace, {
-      recursive: true,
-      force: true
-    });
 
     await fsp.mkdir(
       workspace,
-      { recursive: true }
+      {
+        recursive: true
+      }
+    );
+
+
+    // --------------------------------------------------------
+    // STEP 2
+    // --------------------------------------------------------
+
+    appendJobLog(
+      job,
+      "STEP 2/10: Copying WebView template."
     );
 
     await copyTemplate(workspace);
 
-    await appendJobLog(
+
+    // --------------------------------------------------------
+    // STEP 3
+    // --------------------------------------------------------
+
+    appendJobLog(
       job,
-      `STEP 1/10: Workspace ready ${workspace}`
+      "STEP 3/10: Writing app.properties."
     );
 
-    /* -----------------------------------------
-       PROPERTIES
-    ----------------------------------------- */
+    await writeAppProperties(
+      workspace,
+      job
+    );
 
-    await appendJobLog(
+    await writeGradleProperties(
+      workspace
+    );
+
+
+    // --------------------------------------------------------
+    // STEP 4
+    // --------------------------------------------------------
+
+    appendJobLog(
       job,
-      "STEP 2/10: Writing app.properties"
+      "STEP 4/10: Checking Gradle."
     );
 
-    const content = [
-      `app.url=${job.url}`,
-      `app.package=${job.packageName}`,
-      `app.name=${job.name}`,
-      job.iconUrl
-        ? `app.icon_url=${job.iconUrl}`
-        : ""
-    ]
-      .filter(Boolean)
-      .join("\n") + "\n";
-
-    await fsp.writeFile(
-      properties,
-      content,
-      "utf8"
-    );
-
-    await appendJobLog(
-      job,
-      "STEP 2/10: app.properties written"
-    );
-
-    /* -----------------------------------------
-       GRADLE
-    ----------------------------------------- */
-
-    await appendJobLog(
-      job,
-      "STEP 3/10: Checking Gradle"
-    );
-
-    if (!(await fileExists(GRADLE_BIN))) {
+    if (
+      !fs.existsSync(GRADLE_BIN)
+    ) {
       throw new Error(
         `Gradle not found: ${GRADLE_BIN}`
       );
     }
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `Gradle binary found: ${GRADLE_BIN}`
+      `Gradle exists: ${GRADLE_BIN}`
     );
 
-    const gradleVersion =
-      await runProcess(
-        job,
-        GRADLE_BIN,
-        ["--version"],
-        {
-          cwd: workspace,
-          timeout: 30000
-        }
-      );
 
-    if (gradleVersion.code !== 0) {
-      throw new Error(
-        `Gradle --version failed with code ${gradleVersion.code}`
-      );
-    }
+    // --------------------------------------------------------
+    // STEP 5
+    // --------------------------------------------------------
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `Gradle ${GRADLE_VERSION} OK`
+      "STEP 5/10: Checking Gradle wrapper files."
     );
 
-    /* -----------------------------------------
-       GRADLE BUILD
-    ----------------------------------------- */
-
-    await appendJobLog(
-      job,
-      "STEP 4/10: STARTING ANDROID BUILD"
-    );
-
-    await appendJobLog(
-      job,
-      `Gradle PID will be displayed below`
-    );
-
-    await appendJobLog(
-      job,
-      `JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}`
-    );
-
-    await appendJobLog(
-      job,
-      `GRADLE_OPTS=${GRADLE_OPTS}`
-    );
-
-    await appendJobLog(
-      job,
-      `BUILD TIMEOUT=${BUILD_TIMEOUT}ms`
-    );
-
-    const result =
-      await runProcess(
-        job,
-        GRADLE_BIN,
-        [
-          "assembleDebug",
-          "--no-daemon",
-          "--console=plain",
-          "--stacktrace",
-          "--max-workers=1"
-        ],
-        {
-          cwd: workspace,
-          timeout: BUILD_TIMEOUT
-        }
-      );
-
-    await appendJobLog(
-      job,
-      `STEP 5/10: Gradle finished code=${result.code} signal=${result.signal}`
-    );
-
-    if (result.timedOut) {
-      throw new Error(
-        `Gradle build timeout after ${BUILD_TIMEOUT}ms`
-      );
-    }
-
-    if (result.code !== 0) {
-      throw new Error(
-        `Gradle build failed with exit code ${result.code}`
-      );
-    }
-
-    /* -----------------------------------------
-       APK
-    ----------------------------------------- */
-
-    await appendJobLog(
-      job,
-      "STEP 6/10: Searching APK"
-    );
-
-    const generatedApk =
+    const gradlew =
       path.join(
         workspace,
-        "app",
-        "build",
-        "outputs",
-        "apk",
-        "debug",
-        "app-debug.apk"
+        "gradlew"
       );
 
-    if (!(await fileExists(generatedApk))) {
+    if (!fs.existsSync(gradlew)) {
       throw new Error(
-        `APK not found: ${generatedApk}`
+        "gradlew not found in template."
+      );
+    }
+
+    try {
+      await fsp.chmod(
+        gradlew,
+        0o755
+      );
+    } catch {}
+
+    appendJobLog(
+      job,
+      "gradlew is ready."
+    );
+
+
+    // --------------------------------------------------------
+    // STEP 6
+    // --------------------------------------------------------
+
+    updateJob(job, {
+      step: "Launching Gradle"
+    });
+
+    appendJobLog(
+      job,
+      "STEP 6/10: Launching Gradle."
+    );
+
+    appendJobLog(
+      job,
+      `Memory before Gradle: ${JSON.stringify(
+        systemDiagnostics()
+      )}`
+    );
+
+
+    // --------------------------------------------------------
+    // STEP 7
+    // --------------------------------------------------------
+
+    appendJobLog(
+      job,
+      "STEP 7/10: Running Android build."
+    );
+
+    const gradleArgs = [
+      "assembleDebug",
+
+      "--no-daemon",
+
+      "--console=plain",
+
+      "--stacktrace",
+
+      "--max-workers=1",
+
+      "--no-parallel"
+    ];
+
+    appendJobLog(
+      job,
+      `Command: ${GRADLE_BIN} ${gradleArgs.join(" ")}`
+    );
+
+    await runProcess(
+      job,
+      GRADLE_BIN,
+      gradleArgs,
+      {
+        cwd: workspace
+      }
+    );
+
+
+    // --------------------------------------------------------
+    // STEP 8
+    // --------------------------------------------------------
+
+    appendJobLog(
+      job,
+      "STEP 8/10: Checking generated APK."
+    );
+
+    appendJobLog(
+      job,
+      `Memory after Gradle: ${JSON.stringify(
+        systemDiagnostics()
+      )}`
+    );
+
+    if (!fs.existsSync(apkSource)) {
+      throw new Error(
+        `APK not found: ${apkSource}`
       );
     }
 
     const apkStat =
-      await fsp.stat(generatedApk);
+      await fsp.stat(apkSource);
 
-    await appendJobLog(
-      job,
-      `APK FOUND size=${Math.round(apkStat.size / 1024)}KB`
-    );
-
-    /* -----------------------------------------
-       FINAL APK
-    ----------------------------------------- */
-
-    await appendJobLog(
-      job,
-      "STEP 7/10: Copying final APK"
-    );
-
-    const finalApk =
-      path.join(
-        BUILDS_DIR,
-        `${job.id}.apk`
+    if (apkStat.size <= 0) {
+      throw new Error(
+        "Generated APK is empty."
       );
+    }
+
+    appendJobLog(
+      job,
+      `APK generated: ${apkStat.size} bytes`
+    );
+
+
+    // --------------------------------------------------------
+    // STEP 9
+    // --------------------------------------------------------
+
+    updateJob(job, {
+      step: "Copying APK"
+    });
+
+    appendJobLog(
+      job,
+      "STEP 9/10: Copying final APK."
+    );
 
     await fsp.copyFile(
-      generatedApk,
+      apkSource,
       finalApk
     );
 
-    await appendJobLog(
+    const finalApkStat =
+      await fsp.stat(finalApk);
+
+    appendJobLog(
       job,
-      `FINAL APK: ${finalApk}`
+      `Final APK: ${finalApk}`
     );
 
-    /* -----------------------------------------
-       ZIP
-    ----------------------------------------- */
-
-    await appendJobLog(
+    appendJobLog(
       job,
-      "STEP 8/10: Creating ZIP"
+      `Final APK size: ${finalApkStat.size} bytes`
     );
 
-    const finalZip =
-      path.join(
-        BUILDS_DIR,
-        `${job.id}.zip`
-      );
 
-    const zipResult =
-      await runProcess(
-        job,
-        "zip",
-        [
-          "-j",
-          finalZip,
-          finalApk
-        ],
-        {
-          cwd: BUILDS_DIR,
-          timeout: 60000
-        }
-      );
+    // --------------------------------------------------------
+    // STEP 10
+    // --------------------------------------------------------
 
-    if (zipResult.code !== 0) {
+    updateJob(job, {
+      step: "Creating ZIP"
+    });
+
+    appendJobLog(
+      job,
+      "STEP 10/10: Creating ZIP."
+    );
+
+    /*
+     * ZIP only contains the final APK.
+     *
+     * This keeps the result small and avoids copying
+     * the entire Android project.
+     */
+    await runProcess(
+      job,
+      "zip",
+      [
+        "-j",
+        finalZip,
+        finalApk
+      ],
+      {
+        cwd: BUILDS_DIR
+      }
+    );
+
+    if (!fs.existsSync(finalZip)) {
       throw new Error(
-        `ZIP creation failed with exit code ${zipResult.code}`
+        "ZIP was not created."
       );
     }
 
     const zipStat =
       await fsp.stat(finalZip);
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `ZIP CREATED size=${Math.round(zipStat.size / 1024)}KB`
+      `ZIP created: ${zipStat.size} bytes`
     );
 
-    /* -----------------------------------------
-       FINAL CHECK
-    ----------------------------------------- */
 
-    await appendJobLog(
-      job,
-      "STEP 9/10: Final verification"
-    );
+    // --------------------------------------------------------
+    // SUCCESS
+    // --------------------------------------------------------
 
-    const apkExists =
-      await fileExists(finalApk);
-
-    const zipExists =
-      await fileExists(finalZip);
-
-    if (!apkExists) {
-      throw new Error(
-        "Final APK verification failed"
-      );
-    }
-
-    if (!zipExists) {
-      throw new Error(
-        "Final ZIP verification failed"
-      );
-    }
-
-    const duration =
-      Date.now() - buildStarted;
-
-    const externalUrl =
+    const baseUrl =
       process.env.RENDER_EXTERNAL_URL ||
-      `http://localhost:${PORT}`;
+      null;
 
-    await updateJob(job, {
+    updateJob(job, {
       status: "completed",
-
-      finishedAt: now(),
-
-      durationMs: duration,
-
-      apk: {
-        path: finalApk,
-        size: apkStat.size,
-        url:
-          `${externalUrl}/api/download/${job.id}/apk`
-      },
-
-      zip: {
-        path: finalZip,
-        size: zipStat.size,
-        url:
-          `${externalUrl}/api/download/${job.id}/zip`
-      }
+      step: "Completed",
+      apkPath: finalApk,
+      zipPath: finalZip,
+      apkSize: finalApkStat.size,
+      zipSize: zipStat.size,
+      downloadUrl: baseUrl
+        ? `${baseUrl}/api/download/${job.id}/apk`
+        : `/api/download/${job.id}/apk`,
+      zipDownloadUrl: baseUrl
+        ? `${baseUrl}/api/download/${job.id}/zip`
+        : `/api/download/${job.id}/zip`
     });
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      "STEP 10/10: BUILD SUCCESS"
+      "=================================================="
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `TOTAL BUILD TIME=${duration}ms`
+      "BUILD COMPLETED SUCCESSFULLY."
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `APK URL=${externalUrl}/api/download/${job.id}/apk`
+      `APK URL: ${
+        baseUrl
+          ? `${baseUrl}/api/download/${job.id}/apk`
+          : `/api/download/${job.id}/apk`
+      }`
     );
 
-    await appendJobLog(
+    appendJobLog(
       job,
-      `ZIP URL=${externalUrl}/api/download/${job.id}/zip`
-    );
-
-    await appendJobLog(
-      job,
-      `FINAL MEMORY=${JSON.stringify(memoryMB())}`
-    );
-
-    await appendJobLog(
-      job,
-      `FINAL DISK=${JSON.stringify(diskInfo("/"))}`
-    );
-
-    await appendJobLog(
-      job,
-      "========================================"
+      `ZIP URL: ${
+        baseUrl
+          ? `${baseUrl}/api/download/${job.id}/zip`
+          : `/api/download/${job.id}/zip`
+      }`
     );
 
   } catch (error) {
 
-    const duration =
-      Date.now() - buildStarted;
-
     console.error(
-      `[JOB ${job.id}] BUILD FAILED`
+      `[BUILD ${job.id}] FAILED`,
+      error
     );
 
-    console.error(
-      error.stack || error
-    );
-
-    await appendJobLog(
-      job,
-      `BUILD FAILED: ${error.stack || error}`
-    );
-
-    await appendJobLog(
-      job,
-      `FAILURE AFTER=${duration}ms`
-    );
-
-    await appendJobLog(
-      job,
-      `FAILURE MEMORY=${JSON.stringify(memoryMB())}`
-    );
-
-    await appendJobLog(
-      job,
-      `FAILURE DISK=${JSON.stringify(diskInfo("/"))}`
-    );
-
-    await appendJobLog(
-      job,
-      `FAILURE CGROUP=${JSON.stringify(cgroupInfo())}`
-    );
-
-    await updateJob(job, {
+    updateJob(job, {
       status: "failed",
-      finishedAt: now(),
-      durationMs: duration,
-      error: error.stack || String(error)
+      step: "Failed",
+      error:
+        error.stack ||
+        error.message ||
+        String(error)
     });
 
+    appendJobLog(
+      job,
+      `BUILD FAILED: ${
+        error.stack ||
+        error.message ||
+        error
+      }`
+    );
+
   } finally {
-
-    if (monitor) {
-      clearInterval(monitor);
-    }
-
-    activeJobId = null;
-
-    /* Nettoyage workspace */
 
     try {
       await fsp.rm(
@@ -1093,450 +1296,575 @@ async function processBuild(job) {
         }
       );
 
-      console.log(
-        `[JOB ${job.id}] Workspace cleaned`
+      appendJobLog(
+        job,
+        "Workspace cleaned."
       );
 
-    } catch (err) {
+    } catch (cleanupError) {
 
-      console.error(
-        `[JOB ${job.id}] Workspace cleanup failed:`,
-        err.message
+      appendJobLog(
+        job,
+        `Workspace cleanup failed: ${
+          cleanupError.message
+        }`
       );
     }
 
-    await processQueue();
-  }
-}
+    activeJob = null;
 
-/* =========================================================
-   QUEUE
-========================================================= */
-
-async function processQueue() {
-  if (activeJobId) return;
-
-  const nextId = queue.shift();
-
-  if (!nextId) return;
-
-  const job = jobs.get(nextId);
-
-  if (!job) {
-    return processQueue();
-  }
-
-  activeJobId = job.id;
-
-  console.log(
-    `[QUEUE] Starting job ${job.id}`
-  );
-
-  processBuild(job)
-    .catch(async err => {
-
-      console.error(
-        `[QUEUE] Unexpected processBuild error`,
-        err
-      );
-
-      try {
-        await updateJob(job, {
-          status: "failed",
-          error: err.stack || String(err),
-          finishedAt: now()
-        });
-      } catch {}
-    });
-}
-
-/* =========================================================
-   REQUEST LOGGING
-========================================================= */
-
-app.use((req, res, next) => {
-
-  const started = Date.now();
-
-  const requestId =
-    req.headers["rndr-id"] ||
-    crypto.randomUUID();
-
-  req.requestId = requestId;
-
-  console.log(
-    `[HTTP ${requestId}] ${req.method} ${req.originalUrl}`
-  );
-
-  res.on("finish", () => {
-
-    console.log(
-      `[HTTP ${requestId}] ${req.method} ${req.originalUrl} ` +
-      `status=${res.statusCode} ` +
-      `duration=${Date.now() - started}ms`
+    appendJobLog(
+      job,
+      `Final diagnostics: ${JSON.stringify(
+        systemDiagnostics()
+      )}`
     );
+  }
+}
+
+
+// ============================================================
+// BUILD QUEUE
+// ============================================================
+
+function enqueueBuild(job) {
+
+  if (
+    queuedBuilds.length >= MAX_QUEUE
+  ) {
+    return false;
+  }
+
+  queuedBuilds.push(job.id);
+
+  updateJob(job, {
+    status: "queued",
+    queuePosition:
+      queuedBuilds.length
   });
 
-  next();
-});
+  processQueue();
 
-/* =========================================================
-   ROUTES
-========================================================= */
+  return true;
+}
+
+async function processQueue() {
+
+  if (activeJob) {
+    return;
+  }
+
+  const id =
+    queuedBuilds.shift();
+
+  if (!id) {
+    return;
+  }
+
+  const job =
+    jobs.get(id);
+
+  if (!job) {
+    processQueue();
+    return;
+  }
+
+  updateJob(job, {
+    status: "starting",
+    queuePosition: null
+  });
+
+  try {
+
+    await processBuild(job);
+
+  } catch (error) {
+
+    console.error(
+      `[QUEUE ${id}] unexpected error:`,
+      error
+    );
+
+    updateJob(job, {
+      status: "failed",
+      error:
+        error.stack ||
+        error.message ||
+        String(error)
+    });
+
+  } finally {
+
+    activeJob = null;
+
+    setImmediate(
+      processQueue
+    );
+  }
+}
+
+
+// ============================================================
+// ROUTES
+// ============================================================
 
 app.get("/", (req, res) => {
 
   res.json({
     success: true,
-    service: "gabinarou-webview-apk-builder",
+    service:
+      "gabinarou-webview-apk-builder",
     version: VERSION,
     status: "online",
-    activeJob: activeJobId,
-    queuedJobs: queue.length,
-    uptimeSeconds: Math.round(process.uptime())
+    endpoints: {
+      health: "/health",
+      debug: "/api/debug",
+      build: "POST /api/build",
+      status: "GET /api/build/:id",
+      logs: "GET /api/build/:id/logs",
+      apk:
+        "GET /api/download/:id/apk",
+      zip:
+        "GET /api/download/:id/zip"
+    }
   });
 });
 
-/* -----------------------------------------
-   HEALTH
------------------------------------------ */
 
-app.get("/health", async (req, res) => {
+app.get("/health", (req, res) => {
 
   const gradleExists =
-    await fileExists(GRADLE_BIN);
+    fs.existsSync(GRADLE_BIN);
 
-  const platformPath =
-    path.join(
-      process.env.ANDROID_SDK_ROOT ||
-      "/opt/android-sdk",
-      "platforms",
-      "android-37"
+  const sdkRoot =
+    process.env.ANDROID_SDK_ROOT ||
+    "/opt/android-sdk";
+
+  const platform37 =
+    fs.existsSync(
+      path.join(
+        sdkRoot,
+        "platforms",
+        "android-37"
+      )
     );
 
-  const buildToolsRoot =
-    path.join(
-      process.env.ANDROID_SDK_ROOT ||
-      "/opt/android-sdk",
-      "build-tools"
+  const buildTools37 =
+    fs.existsSync(
+      path.join(
+        sdkRoot,
+        "build-tools",
+        "37.0.0"
+      )
     );
 
-  let buildTools = [];
-
-  try {
-    buildTools =
-      (await fsp.readdir(buildToolsRoot))
-        .filter(v => v.startsWith("37."));
-  } catch {}
-
-  res.status(
-    gradleExists ? 200 : 503
-  ).json({
-    success: gradleExists,
+  res.json({
+    success: true,
 
     service:
       "gabinarou-webview-apk-builder",
 
     version: VERSION,
 
-    status:
-      gradleExists
-        ? "online"
-        : "degraded",
+    status: "online",
 
     uptimeSeconds:
       Math.round(process.uptime()),
 
-    activeJob:
-      activeJobId,
+    activeJob,
 
     queuedJobs:
-      queue.length,
+      queuedBuilds.length,
 
     gradle: {
-      installed:
-        gradleExists,
-
-      version:
-        GRADLE_VERSION,
-
-      path:
-        GRADLE_BIN
+      installed: gradleExists,
+      version: GRADLE_VERSION,
+      path: GRADLE_BIN
     },
 
     android: {
-      sdkRoot:
-        process.env.ANDROID_SDK_ROOT,
-
-      platform37:
-        await fileExists(platformPath),
-
-      buildTools37:
-        buildTools
+      sdkRoot,
+      platform37,
+      buildTools37: buildTools37
+        ? ["37.0.0"]
+        : []
     },
 
     memory:
       memoryMB(),
 
     disk:
-      diskInfo("/"),
+      diskInfo(),
 
     cgroup:
-      cgroupInfo(),
+      readCgroupMemory(),
 
-    time:
-      now()
+    limits: {
+      node:
+        NODE_OPTIONS_VALUE,
+
+      java:
+        JAVA_TOOL_OPTIONS,
+
+      gradle:
+        GRADLE_JVM_ARGS,
+
+      workers: 1,
+
+      timeoutMs:
+        BUILD_TIMEOUT,
+
+      maxQueue:
+        MAX_QUEUE
+    }
   });
 });
 
-/* -----------------------------------------
-   DEBUG
------------------------------------------ */
 
-app.get("/api/debug", async (req, res) => {
+app.get("/api/debug", (req, res) => {
 
   res.json({
     success: true,
 
     version: VERSION,
 
-    server: {
-      pid: process.pid,
-      uptimeSeconds: Math.round(process.uptime()),
-      startedAt:
-        new Date(startedAt).toISOString()
-    },
+    pid: process.pid,
 
-    queue: {
-      activeJobId,
-      queuedJobs: queue.length,
-      queue
-    },
+    activeJob,
 
-    system:
+    queue: queuedBuilds,
+
+    diagnostics:
       systemDiagnostics(),
 
-    gradle: {
-      path: GRADLE_BIN,
-      version: GRADLE_VERSION,
-      exists:
-        await fileExists(GRADLE_BIN)
+    environment: {
+      port: PORT,
+      host: HOST,
+      node:
+        process.version,
+
+      gradleBin:
+        GRADLE_BIN,
+
+      gradleHome:
+        process.env.GRADLE_HOME ||
+        null,
+
+      androidSdk:
+        process.env.ANDROID_SDK_ROOT ||
+        null
     },
 
-    android: {
-      sdkRoot:
-        process.env.ANDROID_SDK_ROOT,
-
-      sdkExists:
-        await fileExists(
-          process.env.ANDROID_SDK_ROOT ||
-          "/opt/android-sdk"
-        )
+    paths: {
+      root: ROOT,
+      template: TEMPLATE_DIR,
+      jobs: JOBS_DIR,
+      builds: BUILDS_DIR,
+      workspaces: WORKSPACES_DIR
     }
   });
 });
 
-/* -----------------------------------------
-   CREATE BUILD
------------------------------------------ */
+
+// ============================================================
+// POST /api/build
+// ============================================================
 
 app.post("/api/build", async (req, res) => {
 
-  const {
-    url,
-    name,
-    packageName,
-    version,
-    iconUrl
-  } = req.body || {};
+  try {
 
-  console.log(
-    `[BUILD REQUEST ${req.requestId}]`
-  );
-
-  console.log(
-    JSON.stringify({
+    const {
       url,
       name,
       packageName,
       version,
       iconUrl
-    })
-  );
+    } = req.body || {};
 
-  if (!url ||
-      !name ||
-      !packageName ||
-      !version) {
+    // --------------------------------------------------------
+    // Validation
+    // --------------------------------------------------------
 
-    return res.status(400).json({
+    if (!url) {
+      return res.status(400).json({
+        success: false,
+        error: "url is required"
+      });
+    }
+
+    if (!isHttpsUrl(url)) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "url must be a valid HTTPS URL"
+      });
+    }
+
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        error: "name is required"
+      });
+    }
+
+    if (!packageName) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "packageName is required"
+      });
+    }
+
+    if (!validatePackageName(packageName)) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Invalid Android packageName"
+      });
+    }
+
+    if (iconUrl && !isHttpsUrl(iconUrl)) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "iconUrl must be a valid HTTPS URL"
+      });
+    }
+
+    // --------------------------------------------------------
+    // Queue limit
+    // --------------------------------------------------------
+
+    if (
+      queuedBuilds.length >= MAX_QUEUE &&
+      activeJob
+    ) {
+      return res.status(429).json({
+        success: false,
+        error:
+          "Build queue is full",
+        activeJob,
+        queuedJobs:
+          queuedBuilds.length
+      });
+    }
+
+    // --------------------------------------------------------
+    // Job
+    // --------------------------------------------------------
+
+    const id = createId();
+
+    const job = {
+      id,
+
+      status: "created",
+
+      step: "Creating job",
+
+      createdAt: now(),
+
+      updatedAt: now(),
+
+      url,
+
+      name:
+        String(name)
+          .trim()
+          .slice(0, 80),
+
+      packageName,
+
+      version:
+        version ||
+        "1.0.0",
+
+      iconUrl:
+        iconUrl || null,
+
+      requestId:
+        req.headers["rndr-id"] ||
+        crypto.randomUUID(),
+
+      statusUrl:
+        `/api/build/${id}`,
+
+      logsUrl:
+        `/api/build/${id}/logs`
+    };
+
+    jobs.set(
+      id,
+      job
+    );
+
+    await saveJob(job);
+
+    appendJobLog(
+      job,
+      `NEW BUILD JOB: ${id}`
+    );
+
+    appendJobLog(
+      job,
+      `Request: ${JSON.stringify({
+        url,
+        name,
+        packageName,
+        version,
+        iconUrl
+      })}`
+    );
+
+    // --------------------------------------------------------
+    // Queue
+    // --------------------------------------------------------
+
+    const accepted =
+      enqueueBuild(job);
+
+    if (!accepted) {
+
+      updateJob(job, {
+        status: "rejected",
+        error:
+          "Build queue is full"
+      });
+
+      return res.status(429).json({
+        success: false,
+        error:
+          "Build queue is full"
+      });
+    }
+
+    const baseUrl =
+      getPublicBaseUrl(req);
+
+    return res.status(202).json({
+      success: true,
+
+      jobId: id,
+
+      status: job.status,
+
+      statusUrl:
+        `${baseUrl}/api/build/${id}`,
+
+      logsUrl:
+        `${baseUrl}/api/build/${id}/logs`
+    });
+
+  } catch (error) {
+
+    console.error(
+      "[POST /api/build]",
+      error
+    );
+
+    return res.status(500).json({
       success: false,
       error:
-        "url, name, packageName and version are required"
+        error.message ||
+        String(error)
     });
   }
-
-  if (!validateHttpsUrl(url)) {
-
-    return res.status(400).json({
-      success: false,
-      error:
-        "URL must use HTTPS"
-    });
-  }
-
-  if (!validatePackageName(packageName)) {
-
-    return res.status(400).json({
-      success: false,
-      error:
-        "Invalid Android package name"
-    });
-  }
-
-  if (queue.length >= MAX_QUEUE) {
-
-    return res.status(429).json({
-      success: false,
-      error:
-        "Build queue is full",
-      maxQueue:
-        MAX_QUEUE
-    });
-  }
-
-  const id =
-    crypto.randomBytes(12).toString("hex");
-
-  const job = {
-    id,
-
-    status:
-      "queued",
-
-    createdAt:
-      now(),
-
-    updatedAt:
-      now(),
-
-    url,
-
-    name,
-
-    packageName,
-
-    version,
-
-    iconUrl:
-      iconUrl || null,
-
-    requestId:
-      req.requestId,
-
-    statusUrl:
-      `/api/build/${id}`,
-
-    logsUrl:
-      `/api/build/${id}/logs`
-  };
-
-  await saveJob(job);
-
-  await appendJobLog(
-    job,
-    `JOB CREATED requestId=${req.requestId}`
-  );
-
-  queue.push(id);
-
-  await appendJobLog(
-    job,
-    `JOB QUEUED position=${queue.length}`
-  );
-
-  processQueue();
-
-  res.status(202).json({
-    success: true,
-
-    jobId: id,
-
-    status:
-      job.status,
-
-    statusUrl:
-      `/api/build/${id}`,
-
-    logsUrl:
-      `/api/build/${id}/logs`
-  });
 });
 
-/* -----------------------------------------
-   JOB STATUS
------------------------------------------ */
 
-app.get("/api/build/:id", async (req, res) => {
+// ============================================================
+// GET JOB
+// ============================================================
 
-  const job =
-    jobs.get(req.params.id);
+app.get(
+  "/api/build/:id",
+  async (req, res) => {
 
-  if (!job) {
+    const job =
+      jobs.get(req.params.id);
 
-    return res.status(404).json({
-      success: false,
-      error:
-        "Build job not found"
+    if (!job) {
+
+      /*
+       * Try persistent file if Node restarted.
+       */
+      try {
+
+        const raw =
+          await fsp.readFile(
+            jobFile(req.params.id),
+            "utf8"
+          );
+
+        const saved =
+          JSON.parse(raw);
+
+        jobs.set(
+          saved.id,
+          saved
+        );
+
+        return res.json({
+          success: true,
+          job: saved
+        });
+
+      } catch {
+
+        return res.status(404).json({
+          success: false,
+          error:
+            "Build job not found"
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      job
     });
   }
+);
 
-  res.json({
-    success: true,
-    job
-  });
-});
 
-/* -----------------------------------------
-   JOB LOGS
------------------------------------------ */
+// ============================================================
+// GET LOGS
+// ============================================================
 
-app.get("/api/build/:id/logs", async (req, res) => {
+app.get(
+  "/api/build/:id/logs",
+  async (req, res) => {
 
-  const file =
-    jobLogPath(req.params.id);
+    const file =
+      logFile(req.params.id);
 
-  if (!(await fileExists(file))) {
+    try {
 
-    return res.status(404).json({
-      success: false,
-      error:
-        "Build logs not found"
-    });
+      const content =
+        await fsp.readFile(
+          file,
+          "utf8"
+        );
+
+      res.type("text/plain");
+      return res.send(content);
+
+    } catch {
+
+      return res.status(404).json({
+        success: false,
+        error:
+          "Build logs not found"
+      });
+    }
   }
+);
 
-  try {
 
-    const content =
-      await fsp.readFile(
-        file,
-        "utf8"
-      );
-
-    res.type("text/plain").send(content);
-
-  } catch (err) {
-
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
-
-/* -----------------------------------------
-   DOWNLOAD APK
------------------------------------------ */
+// ============================================================
+// DOWNLOAD APK
+// ============================================================
 
 app.get(
   "/api/download/:id/apk",
@@ -1545,34 +1873,48 @@ app.get(
     const job =
       jobs.get(req.params.id);
 
-    if (!job || !job.apk) {
-
+    if (!job) {
       return res.status(404).json({
         success: false,
         error:
-          "APK not available"
+          "Build job not found"
       });
     }
 
-    if (!(await fileExists(job.apk.path))) {
+    if (
+      job.status !== "completed"
+    ) {
+      return res.status(409).json({
+        success: false,
+        error:
+          "Build is not completed",
+        status:
+          job.status
+      });
+    }
 
+    if (
+      !job.apkPath ||
+      !fs.existsSync(job.apkPath)
+    ) {
       return res.status(404).json({
         success: false,
         error:
-          "APK file no longer exists"
+          "APK file not found"
       });
     }
 
-    res.download(
-      job.apk.path,
-      `${job.packageName}.apk`
+    return res.download(
+      job.apkPath,
+      `${safeName(job.name)}.apk`
     );
   }
 );
 
-/* -----------------------------------------
-   DOWNLOAD ZIP
------------------------------------------ */
+
+// ============================================================
+// DOWNLOAD ZIP
+// ============================================================
 
 app.get(
   "/api/download/:id/zip",
@@ -1581,151 +1923,100 @@ app.get(
     const job =
       jobs.get(req.params.id);
 
-    if (!job || !job.zip) {
-
+    if (!job) {
       return res.status(404).json({
         success: false,
         error:
-          "ZIP not available"
+          "Build job not found"
       });
     }
 
-    if (!(await fileExists(job.zip.path))) {
+    if (
+      job.status !== "completed"
+    ) {
+      return res.status(409).json({
+        success: false,
+        error:
+          "Build is not completed",
+        status:
+          job.status
+      });
+    }
 
+    if (
+      !job.zipPath ||
+      !fs.existsSync(job.zipPath)
+    ) {
       return res.status(404).json({
         success: false,
         error:
-          "ZIP file no longer exists"
+          "ZIP file not found"
       });
     }
 
-    res.download(
-      job.zip.path,
-      `${job.packageName}-android.zip`
+    return res.download(
+      job.zipPath,
+      `${safeName(job.name)}.zip`
     );
   }
 );
 
-/* =========================================================
-   SIGNAL HANDLING
-========================================================= */
 
-let shuttingDown = false;
-
-async function gracefulShutdown(signal) {
-
-  if (shuttingDown) return;
-
-  shuttingDown = true;
-
-  console.error(
-    `[PROCESS] ${signal} RECEIVED`
-  );
-
-  console.error(
-    `[PROCESS] PID=${process.pid}`
-  );
-
-  console.error(
-    `[PROCESS] activeJob=${activeJobId}`
-  );
-
-  logSystem(
-    `[PROCESS ${signal}]`
-  );
-
-  if (activeJobId) {
-
-    const job =
-      jobs.get(activeJobId);
-
-    if (job) {
-
-      try {
-
-        await appendJobLog(
-          job,
-          `RENDER/PROCESS SHUTDOWN: ${signal}`
-        );
-
-        await appendJobLog(
-          job,
-          `ACTIVE BUILD INTERRUPTED BY PROCESS SHUTDOWN`
-        );
-
-        await updateJob(job, {
-          status: "failed",
-          error:
-            `Process received ${signal}`,
-          finishedAt: now()
-        });
-
-      } catch {}
-    }
-  }
-
-  server.close(() => {
-
-    console.log(
-      "[PROCESS] HTTP server closed"
-    );
-
-    process.exit(0);
-  });
-
-  setTimeout(() => {
-
-    console.error(
-      "[PROCESS] Forced shutdown"
-    );
-
-    process.exit(1);
-
-  }, 15000);
-}
+// ============================================================
+// PROCESS DIAGNOSTICS
+// ============================================================
 
 process.on(
   "SIGTERM",
-  () => gracefulShutdown("SIGTERM")
+  () => {
+
+    console.error(
+      "[PROCESS] SIGTERM received."
+    );
+
+    if (activeJob) {
+      console.error(
+        `[PROCESS] Active job: ${activeJob}`
+      );
+    }
+
+    /*
+     * Let Render terminate the process normally.
+     */
+    process.exit(0);
+  }
 );
 
 process.on(
   "SIGINT",
-  () => gracefulShutdown("SIGINT")
+  () => {
+
+    console.error(
+      "[PROCESS] SIGINT received."
+    );
+
+    process.exit(0);
+  }
 );
 
 process.on(
   "uncaughtException",
-  err => {
+  error => {
 
     console.error(
-      "[PROCESS] UNCAUGHT EXCEPTION"
-    );
-
-    console.error(
-      err.stack || err
-    );
-
-    logSystem(
-      "[PROCESS UNCAUGHT]"
+      "[PROCESS] UNCAUGHT EXCEPTION:",
+      error.stack || error
     );
   }
 );
 
 process.on(
   "unhandledRejection",
-  reason => {
+  error => {
 
     console.error(
-      "[PROCESS] UNHANDLED REJECTION"
-    );
-
-    console.error(
-      reason
-    );
-
-    logSystem(
-      "[PROCESS REJECTION]"
+      "[PROCESS] UNHANDLED REJECTION:",
+      error
     );
   }
 );
@@ -1734,28 +2025,28 @@ process.on(
   "exit",
   code => {
 
-    console.log(
+    console.error(
       `[PROCESS] EXIT code=${code}`
-    );
-
-    logSystem(
-      "[PROCESS EXIT]"
     );
   }
 );
 
-/* =========================================================
-   STARTUP
-========================================================= */
+
+// ============================================================
+// STARTUP
+// ============================================================
 
 async function startup() {
 
-  console.log("");
-  console.log("========================================");
+  await ensureDirectories();
+
+  console.log(
+    "=================================================="
+  );
+
   console.log(
     `Gabinarou WebView APK Builder v${VERSION}`
   );
-  console.log("========================================");
 
   console.log(
     `PORT: ${PORT}`
@@ -1766,19 +2057,23 @@ async function startup() {
   );
 
   console.log(
-    `API: /api/build`
+    "API: /api/build"
   );
 
   console.log(
-    `Health: /health`
+    "Health: /health"
   );
 
   console.log(
-    `Debug: /api/debug`
+    "Debug: /api/debug"
   );
 
   console.log(
-    `Gradle: PREINSTALLED`
+    "Logs: /api/build/:id/logs"
+  );
+
+  console.log(
+    "Gradle: PREINSTALLED"
   );
 
   console.log(
@@ -1794,7 +2089,15 @@ async function startup() {
   );
 
   console.log(
-    `Gradle JVM: ${JAVA_TOOL_OPTIONS}`
+    `Java heap: 160MB`
+  );
+
+  console.log(
+    `Java metaspace: 64MB`
+  );
+
+  console.log(
+    `Node heap: ${NODE_OPTIONS_VALUE}`
   );
 
   console.log(
@@ -1813,56 +2116,63 @@ async function startup() {
     `PID: ${process.pid}`
   );
 
-  await ensureDirs();
-
   console.log(
-    `Template exists: ${await fileExists(TEMPLATE_DIR)}`
-  );
-
-  console.log(
-    `Gradle exists: ${await fileExists(GRADLE_BIN)}`
+    `Template exists: ${fs.existsSync(
+      TEMPLATE_DIR
+    )}`
   );
 
   console.log(
-    `Android SDK: ${process.env.ANDROID_SDK_ROOT}`
-  );
-
-  logSystem(
-    "[STARTUP]"
-  );
-
-  console.log(
-    "========================================"
+    `Gradle exists: ${fs.existsSync(
+      GRADLE_BIN
+    )}`
   );
 
   console.log(
-    "Your service is live"
+    `Android SDK: ${
+      process.env.ANDROID_SDK_ROOT ||
+      "/opt/android-sdk"
+    }`
   );
 
   console.log(
-    process.env.RENDER_EXTERNAL_URL ||
-    `http://localhost:${PORT}`
+    `Initial diagnostics: ${JSON.stringify(
+      systemDiagnostics()
+    )}`
   );
 
   console.log(
-    "========================================"
+    "=================================================="
   );
-}
 
-const server =
   app.listen(
     PORT,
     HOST,
-    async () => {
+    () => {
 
-      try {
-        await startup();
-      } catch (err) {
+      console.log(
+        "Your service is live"
+      );
 
-        console.error(
-          "[STARTUP ERROR]",
-          err
+      if (process.env.RENDER_EXTERNAL_URL) {
+        console.log(
+          process.env.RENDER_EXTERNAL_URL
+        );
+      } else {
+        console.log(
+          `http://${HOST}:${PORT}`
         );
       }
     }
   );
+}
+
+startup().catch(error => {
+
+  console.error(
+    "STARTUP FAILED:",
+    error.stack || error
+  );
+
+  process.exit(1);
+});
