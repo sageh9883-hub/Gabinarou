@@ -3,20 +3,11 @@ FROM node:20-bookworm
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ============================================================
-# ENVIRONNEMENT ANDROID
+# ANDROID
 # ============================================================
 
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
 ENV ANDROID_HOME=/opt/android-sdk
-
-ENV PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/gradle/gradle-9.7.1/bin:$PATH
-
-# ============================================================
-# LIMITES MÉMOIRE
-# ============================================================
-
-ENV JAVA_TOOL_OPTIONS="-Xmx256m -XX:MaxMetaspaceSize=128m"
-ENV GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx256m -Dorg.gradle.daemon=false"
 
 # ============================================================
 # GRADLE
@@ -25,15 +16,28 @@ ENV GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx256m -Dorg.gradle.daemon=false"
 ENV GRADLE_VERSION=9.7.1
 ENV GRADLE_HOME=/opt/gradle/gradle-9.7.1
 
+ENV PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/gradle/gradle-9.7.1/bin:$PATH
+
 # ============================================================
-# PORT
+# MEMORY LIMITS
+# ============================================================
+
+ENV NODE_OPTIONS="--max-old-space-size=96"
+
+ENV JAVA_TOOL_OPTIONS="-Xms32m -Xmx160m -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=32m -XX:+UseSerialGC -XX:ActiveProcessorCount=1"
+
+ENV GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xms32m -Xmx160m -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=32m -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -Dorg.gradle.parallel=false -Dorg.gradle.workers.max=1 -Dorg.gradle.caching=false -Dorg.gradle.configuration-cache=false -Dorg.gradle.vfs.watch=false -Dkotlin.compiler.execution.strategy=in-process -Dkotlin.daemon.enabled=false -Dfile.encoding=UTF-8"
+
+# ============================================================
+# SERVER
 # ============================================================
 
 ENV NODE_ENV=production
 ENV PORT=10000
+ENV GRADLE_USER_HOME=/builder/.gradle
 
 # ============================================================
-# INSTALLATION DES OUTILS SYSTÈME
+# SYSTEM PACKAGES
 # ============================================================
 
 RUN apt-get update && apt-get install -y \
@@ -45,6 +49,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     bash \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # ============================================================
@@ -56,7 +61,8 @@ RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools
 RUN wget -q \
     https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip \
     -O /tmp/cmdline-tools.zip \
-    && unzip -q /tmp/cmdline-tools.zip \
+    && unzip -q \
+       /tmp/cmdline-tools.zip \
        -d ${ANDROID_SDK_ROOT}/cmdline-tools \
     && mv \
        ${ANDROID_SDK_ROOT}/cmdline-tools/cmdline-tools \
@@ -64,26 +70,25 @@ RUN wget -q \
     && rm -f /tmp/cmdline-tools.zip
 
 # ============================================================
-# LICENCES ANDROID
+# ANDROID LICENSES
 # ============================================================
 
 RUN yes | sdkmanager --licenses >/dev/null || true
 
 # ============================================================
-# INSTALLATION DU SDK ANDROID 37
+# ANDROID SDK 37
 # ============================================================
 
 RUN set -eux; \
     sdkmanager --list --channel=3 > /tmp/sdk-list; \
-    echo "========================================"; \
-    echo "ANDROID 37 PACKAGES DISPONIBLES"; \
-    echo "========================================"; \
+    echo "============================================"; \
+    echo "ANDROID 37 AVAILABLE PACKAGES"; \
     grep -E 'platforms;android-37|build-tools;37' /tmp/sdk-list || true; \
-    echo "========================================"; \
+    echo "============================================"; \
     PLATFORM="$(grep -oE 'platforms;android-37([.]?[0-9]+)?' /tmp/sdk-list | sort -V | tail -1)"; \
     BUILD_TOOLS="$(grep -oE 'build-tools;37[.][0-9]+[.][0-9]+' /tmp/sdk-list | sort -V | tail -1)"; \
-    echo "Platform sélectionnée: ${PLATFORM}"; \
-    echo "Build Tools sélectionné: ${BUILD_TOOLS}"; \
+    echo "Selected platform: ${PLATFORM}"; \
+    echo "Selected build tools: ${BUILD_TOOLS}"; \
     test -n "${PLATFORM}"; \
     test -n "${BUILD_TOOLS}"; \
     yes | sdkmanager --channel=3 \
@@ -92,25 +97,33 @@ RUN set -eux; \
         "${BUILD_TOOLS}"
 
 # ============================================================
-# INSTALLATION DE GRADLE 9.7.1
+# GRADLE 9.7.1
 # ============================================================
 
-RUN mkdir -p /opt/gradle \
-    && wget -q \
+RUN mkdir -p /opt/gradle
+
+RUN wget -q \
     https://services.gradle.org/distributions/gradle-9.7.1-bin.zip \
     -O /tmp/gradle.zip \
-    && unzip -q /tmp/gradle.zip -d /opt/gradle \
-    && rm -f /tmp/gradle.zip \
-    && /opt/gradle/gradle-9.7.1/bin/gradle --version
+    && unzip -q \
+       /tmp/gradle.zip \
+       -d /opt/gradle \
+    && rm -f /tmp/gradle.zip
 
 # ============================================================
-# DOSSIER DU BUILDER
+# VERIFY GRADLE
+# ============================================================
+
+RUN /opt/gradle/gradle-9.7.1/bin/gradle --version
+
+# ============================================================
+# BUILDER DIRECTORY
 # ============================================================
 
 WORKDIR /builder
 
 # ============================================================
-# CLONAGE DU TEMPLATE ANDROID
+# WEBVIEW TEMPLATE
 # ============================================================
 
 RUN git clone --depth 1 \
@@ -118,7 +131,7 @@ RUN git clone --depth 1 \
     /builder/template
 
 # ============================================================
-# NODE.JS
+# NODE
 # ============================================================
 
 COPY package.json ./
@@ -126,13 +139,13 @@ COPY package.json ./
 RUN npm install --omit=dev
 
 # ============================================================
-# SERVEUR
+# SERVER
 # ============================================================
 
 COPY server.js ./
 
 # ============================================================
-# DOSSIERS DE TRAVAIL
+# DIRECTORIES
 # ============================================================
 
 RUN mkdir -p \
@@ -142,26 +155,42 @@ RUN mkdir -p \
     /builder/.gradle
 
 # ============================================================
-# GRADLE CACHE
+# GLOBAL GRADLE PROPERTIES
 # ============================================================
 
-ENV GRADLE_USER_HOME=/builder/.gradle
+RUN printf '%s\n' \
+    'org.gradle.daemon=false' \
+    'org.gradle.parallel=false' \
+    'org.gradle.workers.max=1' \
+    'org.gradle.caching=false' \
+    'org.gradle.configuration-cache=false' \
+    'org.gradle.vfs.watch=false' \
+    'kotlin.compiler.execution.strategy=in-process' \
+    'kotlin.daemon.enabled=false' \
+    'android.builder.sdkDownload=false' \
+    'org.gradle.jvmargs=-Xms32m -Xmx160m -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=32m -XX:+UseSerialGC -XX:ActiveProcessorCount=1' \
+    > /builder/.gradle/gradle.properties
 
 # ============================================================
-# INFORMATIONS DE BUILD
+# ENVIRONMENT VERIFICATION
 # ============================================================
 
-RUN echo "========================================" \
-    && echo "GABINAROU WEBVIEW APK BUILDER V3.3" \
-    && echo "========================================" \
+RUN echo "============================================" \
+    && echo "JAVA VERSION" \
     && java -version \
-    && gradle --version \
-    && echo "Android SDK: ${ANDROID_SDK_ROOT}" \
-    && echo "Gradle Home: ${GRADLE_HOME}" \
-    && echo "========================================"
+    && echo "============================================" \
+    && echo "GRADLE VERSION" \
+    && /opt/gradle/gradle-9.7.1/bin/gradle --version \
+    && echo "============================================" \
+    && echo "ANDROID SDK" \
+    && ls -la /opt/android-sdk \
+    && echo "============================================" \
+    && echo "TEMPLATE" \
+    && ls -la /builder/template \
+    && echo "============================================"
 
 # ============================================================
-# PORT
+# NETWORK
 # ============================================================
 
 EXPOSE 10000
